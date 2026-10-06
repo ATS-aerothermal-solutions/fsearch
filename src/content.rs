@@ -28,7 +28,7 @@ pub const MAX_FILE: u64 = 1 << 20;
 const SEG_BYTES: u64 = 64 << 20;
 /// Largest merge, in posting bytes; bounds the merge's transient memory.
 const MERGE_CAP: usize = 96 << 20;
-const MAGIC: &[u8; 8] = b"FSCSEG02";
+const MAGIC: &[u8; 8] = b"FSCSEG03";
 /// tri_off high bit: this trigram's list is a bitset over the segment's docs
 /// (cheaper than varints once more than 1 in 8 docs contain it).
 const BITSET: u32 = 1 << 31;
@@ -322,6 +322,52 @@ fn trigrams_small(s: &[u8]) -> Vec<u32> {
     t
 }
 
+/// Keywords a definition starts with (`sym:` search).
+const DEFINES: &str = "fn|func|function|def|class|struct|enum|trait|interface|type|typealias|impl|let|const|var|val|static|module|mod|protocol|extension|macro_rules!|define|typedef|union|object|record|namespace|actor";
+
+/// The posting key for "this doc defines `name`": a hash above the 24-bit
+/// trigram space, so definitions live in the same key table as trigrams.
+fn symbol_key(name: &[u8]) -> u32 {
+    let h = name.iter().fold(0x811c_9dc5u32, |h, &b| (h ^ b as u32).wrapping_mul(0x0100_0193));
+    h | 0x8000_0000
+}
+
+/// Is `name` something the definition index records (a plain identifier)?
+fn plain_identifier(name: &[u8]) -> bool {
+    name.first().is_some_and(|&b| b.is_ascii_alphabetic() || b == b'_') && name.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Append the sorted distinct definition keys of a buffer to `out`: every
+/// identifier right after a declaring keyword, as `sym:` matches it.
+fn symbols(buf: &[u8], out: &mut Vec<u32>) {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        RegexBuilder::new(&format!(r"(?-u:\b)(?:{DEFINES})(?:<[^>\n]*>)?[ \t*&]+(?:mut[ \t]+)?[A-Za-z_][A-Za-z0-9_]*"))
+            .unicode(false)
+            .build()
+            .unwrap()
+    });
+    let start = out.len();
+    let mut at = 0;
+    while let Some(m) = re.find_at(buf, at) {
+        let end = m.end();
+        let begin = buf[..end].iter().rposition(|&b| !(b.is_ascii_alphanumeric() || b == b'_')).map_or(0, |p| p + 1);
+        out.push(symbol_key(&buf[begin..end]));
+        // The name may itself be a keyword ("static func main"): look again
+        // from it, not past it.
+        at = begin;
+    }
+    out[start..].sort_unstable();
+    let mut seen = start;
+    for i in start..out.len() {
+        if i == start || out[i] != out[seen - 1] {
+            out[seen] = out[i];
+            seen += 1;
+        }
+    }
+    out.truncate(seen);
+}
+
 /// Paths with size and mtime, all in one buffer: a full sync holds ~500k
 /// of them, and one allocation (mmap-backed, returned on drop) beats 500k.
 #[derive(Default)]
@@ -380,13 +426,15 @@ struct DocMeta<'a> {
     rank: i8,
 }
 
-/// One rayon split's output: trigrams of its docs, flat, plus where each
-/// doc's run starts. Reuses one read buffer and one 2 MiB seen-set.
+/// One rayon split's output: trigrams and definition keys of its docs,
+/// flat, plus where each doc's runs start. Reuses one read buffer and one
+/// 2 MiB seen-set.
 struct Split {
     seen: Vec<u64>,
     buf: Vec<u8>,
     flat: Vec<u32>,
-    docs: Vec<(usize, u32, u32, bool)>, // (doc, start, len, is_text)
+    syms: Vec<u32>,
+    docs: Vec<(usize, u32, u32, bool, u32, u32)>, // (doc, tri start, len, is_text, sym start, len)
 }
 
 /// Build one segment file from docs (any order). Files that turn out not
@@ -398,17 +446,18 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
         .into_par_iter()
         .with_min_len(256)
         .fold(
-            || Split { seen: vec![0u64; (1 << 24) / 64], buf: Vec::new(), flat: Vec::new(), docs: Vec::new() },
+            || Split { seen: vec![0u64; (1 << 24) / 64], buf: Vec::new(), flat: Vec::new(), syms: Vec::new(), docs: Vec::new() },
             |mut sp, i| {
                 sp.buf.clear();
                 let ok = open_regular(docs.path(i))
                     .and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut sp.buf).ok())
                     .is_some_and(|n| n as u64 <= MAX_FILE && memchr::memchr(0, &sp.buf[..n.min(8192)]).is_none());
-                let start = sp.flat.len() as u32;
+                let (start, sym) = (sp.flat.len() as u32, sp.syms.len() as u32);
                 if ok {
                     trigrams(&sp.buf, &mut sp.seen, &mut sp.flat);
+                    symbols(&sp.buf, &mut sp.syms);
                 }
-                sp.docs.push((i, start, sp.flat.len() as u32 - start, ok));
+                sp.docs.push((i, start, sp.flat.len() as u32 - start, ok, sym, sp.syms.len() as u32 - sym));
                 sp
             },
         )
@@ -423,25 +472,35 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
     let meta: Vec<DocMeta> = order
         .iter()
         .map(|&(si, k)| {
-            let (i, _, _, text) = splits[si].docs[k];
+            let (i, _, _, text, _, _) = splits[si].docs[k];
             let (_, _, size, mtime) = docs.items[i];
             DocMeta { path: docs.path(i), size, mtime, rank: if text { doc_rank(docs.path(i)) } else { NOT_TEXT } }
         })
         .collect();
     let tris = |d: usize| {
         let (si, k) = order[d];
-        let (_, st, len, _) = splits[si].docs[k];
+        let (_, st, len, _, _, _) = splits[si].docs[k];
         &splits[si].flat[st as usize..(st + len) as usize]
     };
+    let syms = |d: usize| {
+        let (si, k) = order[d];
+        let (_, _, _, _, st, len) = splits[si].docs[k];
+        &splits[si].syms[st as usize..(st + len) as usize]
+    };
+    // Definition keys sort after every trigram (they're above 2^24), so they
+    // follow the trigrams as sorted (key, doc) pairs in either build.
+    let mut sym_pairs: Vec<u64> = (0..order.len()).flat_map(|d| syms(d).iter().map(move |&t| (t as u64) << 32 | d as u64)).collect();
+    sym_pairs.sort_unstable();
     let pairs: usize = (0..order.len()).map(|d| tris(d).len()).sum();
     if pairs < 1 << 22 {
         // Small batch (the usual incremental update): sort the pairs. Cost
         // scales with the batch, not with the 16.7M-slot trigram space.
-        let mut v: Vec<u64> = Vec::with_capacity(pairs);
+        let mut v: Vec<u64> = Vec::with_capacity(pairs + sym_pairs.len());
         for d in 0..order.len() {
             v.extend(tris(d).iter().map(|&t| (t as u64) << 32 | d as u64));
         }
         v.sort_unstable();
+        v.extend_from_slice(&sym_pairs);
         let mut i = 0;
         return write_segment(dir, id, &meta, |list| {
             let t = (*v.get(i)? >> 32) as u32;
@@ -476,11 +535,18 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
     }
     drop(count);
     drop(cur);
-    let mut k = 0;
+    let (mut k, mut i) = (0, 0);
     write_segment(dir, id, &meta, |list| {
-        let t = *keys.get(k)?;
-        list.extend_from_slice(&raw[start[k]..start[k + 1]]);
-        k += 1;
+        if let Some(&t) = keys.get(k) {
+            list.extend_from_slice(&raw[start[k]..start[k + 1]]);
+            k += 1;
+            return Some(t);
+        }
+        let t = (*sym_pairs.get(i)? >> 32) as u32;
+        while i < sym_pairs.len() && (sym_pairs[i] >> 32) as u32 == t {
+            list.push(sym_pairs[i] as u32);
+            i += 1;
+        }
         Some(t)
     })
 }
@@ -909,10 +975,7 @@ impl Grep {
             // A definition: a declaring keyword, optional generics/modifiers,
             // then the name. ASCII word boundaries keep the regex on the fast
             // DFA path even in files with non-ASCII text.
-            GrepMode::Symbol => format!(
-                r"(?-u:\b)(?:fn|func|function|def|class|struct|enum|trait|interface|type|typealias|impl|let|const|var|val|static|module|mod|protocol|extension|macro_rules!|define|typedef|union|object|record|namespace|actor)(?:<[^>\n]*>)?[ \t*&]+(?:mut[ \t]+)?{}(?-u:\b)",
-                regex::escape(pattern)
-            ),
+            GrepMode::Symbol => format!(r"(?-u:\b)(?:{DEFINES})(?:<[^>\n]*>)?[ \t*&]+(?:mut[ \t]+)?{}(?-u:\b)", regex::escape(pattern)),
         };
         let re = RegexBuilder::new(&src)
             .case_insensitive(smart_ci && mode != GrepMode::Symbol)
@@ -925,6 +988,9 @@ impl Grep {
 
     fn plan(&self) -> TQ {
         match self.mode {
+            // Exactly the docs that define it (plus rare hash collisions,
+            // which reading the file weeds out).
+            GrepMode::Symbol if plain_identifier(self.pattern.as_bytes()) => TQ::Tri(symbol_key(self.pattern.as_bytes())),
             GrepMode::Literal | GrepMode::Symbol => literal_plan(self.pattern.as_bytes()),
             GrepMode::Regex => regex_syntax::Parser::new().parse(&self.pattern).map_or(TQ::All, |h| regex_plan(&h)),
         }
