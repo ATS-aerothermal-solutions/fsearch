@@ -51,6 +51,10 @@ pub struct Index {
     u1: usize,
     /// FSEvents id the index is current as of; replay starts here.
     pub event_id: u64,
+    /// Wall-clock second the index is known complete as of (0: unknown).
+    /// If FSEvents history from `event_id` is gone, folders changed since
+    /// then are what needs relisting.
+    pub synced_at: u32,
     off: [usize; NSEC],
     plan: std::sync::OnceLock<MemoPlan>,
 }
@@ -191,7 +195,7 @@ impl Index {
 
     /// Lay listings out as blocks in DFS order and compute everything derived.
     /// Listing id 0 is the root ("/").
-    pub fn build(mut ls: Vec<Listing>, event_id: u64, home: &[u8]) -> Index {
+    pub fn build(mut ls: Vec<Listing>, event_id: u64, synced_at: u32, home: &[u8]) -> Index {
         ls.par_iter_mut().for_each(|l| {
             let names = &l.names;
             l.ents.sort_unstable_by(|a, b| {
@@ -340,7 +344,7 @@ impl Index {
         put(base, off[Sec::DirParent as usize], &dir_entry.iter().map(|&e| parent[e as usize]).collect::<Vec<_>>());
         put(base, off[Sec::NameEntsOff as usize], &ne_off);
         put(base, off[Sec::NameEnts as usize], &ne);
-        put(base, 0, &header(n, d, u, unames.len(), event_id));
+        put(base, 0, &header(n, d, u, unames.len(), event_id, synced_at));
         Index::from_map(m.make_read_only().unwrap()).unwrap()
     }
 
@@ -354,14 +358,14 @@ impl Index {
         if map.len() < total {
             return None;
         }
-        Some(Index { n, d, u, u1: u + 1, names_len, event_id: h(4) as u64, off, map, plan: std::sync::OnceLock::new() })
+        Some(Index { n, d, u, u1: u + 1, names_len, event_id: h(4) as u64, synced_at: h(5) as u32, off, map, plan: std::sync::OnceLock::new() })
     }
 
     /// Write atomically (tmp + rename), stamping the current event id.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let tmp = path.with_extension("tmp");
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&header(self.n, self.d, self.u, self.names_len, self.event_id))?;
+        f.write_all(&header(self.n, self.d, self.u, self.names_len, self.event_id, self.synced_at))?;
         f.write_all(&self.map[HDR..])?;
         f.sync_data()?;
         std::fs::rename(tmp, path)
@@ -399,10 +403,10 @@ impl Index {
     }
 }
 
-fn header(n: usize, d: usize, u: usize, names_len: usize, event_id: u64) -> Vec<u8> {
+fn header(n: usize, d: usize, u: usize, names_len: usize, event_id: u64, synced_at: u32) -> Vec<u8> {
     let mut h = vec![0u8; HDR];
     h[..8].copy_from_slice(MAGIC);
-    for (k, v) in [n as u64, d as u64, u as u64, names_len as u64, event_id].iter().enumerate() {
+    for (k, v) in [n as u64, d as u64, u as u64, names_len as u64, event_id, synced_at as u64].iter().enumerate() {
         h[8 + k * 8..16 + k * 8].copy_from_slice(&v.to_le_bytes());
     }
     h

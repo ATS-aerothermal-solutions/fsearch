@@ -25,6 +25,8 @@ const CONTENT_QUIET: Duration = Duration::from_secs(2);
 const CONTENT_MAX_WAIT: Duration = Duration::from_secs(300);
 /// How often a follower checks whether it can take over or reload.
 const FOLLOW_EVERY: Duration = Duration::from_secs(10);
+/// Seconds before the last known-good moment that a relist also covers.
+const SYNC_MARGIN: u32 = 120;
 
 pub struct Options {
     /// Where the index lives (`index.bin`, `content/`).
@@ -87,6 +89,8 @@ struct Shared {
     owner: AtomicBool,
     lock: std::fs::File,
     stream: Mutex<Option<fsevents::Stream>>,
+    /// The stream is still replaying history (until HISTORY_DONE).
+    replaying: AtomicBool,
     /// Follower: content dir mtime when its segments were last opened.
     content_seen: Mutex<Option<std::time::SystemTime>>,
 }
@@ -156,6 +160,7 @@ impl Engine {
             owner: AtomicBool::new(owner),
             lock,
             stream: Mutex::new(None),
+            replaying: AtomicBool::new(true),
             content_seen: Mutex::new(None),
         });
         let base = Index::load(&shared.dir.join("index.bin"));
@@ -178,7 +183,7 @@ impl Engine {
                     }
                     b
                 }
-                None if owner => full_build(&s, since, true),
+                None if owner => full_build(&s, since),
                 None => {
                     // The owner is building it; follow once it exists.
                     let b = wait_for_index(&s.dir);
@@ -280,6 +285,7 @@ impl Shared {
 
     /// (Re)start the FSEvents stream from `since`, replacing any old one.
     fn watch(&self, since: u64) {
+        self.replaying.store(true, Ordering::Relaxed);
         let new = fsevents::watch(since, 0.1, self.wake.clone());
         *self.stream.lock().unwrap() = Some(new);
     }
@@ -463,19 +469,17 @@ fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
     }
 }
 
-fn full_build(shared: &Shared, event_id: u64, save: bool) -> Index {
+fn full_build(shared: &Shared, event_id: u64) -> Index {
     let t = Instant::now();
+    let started = crate::query::now_secs();
     let (ls, _) = walk::scan(b"/", SCAN_THREADS);
-    let idx = Index::build(ls, event_id, shared.home.as_bytes());
+    let idx = Index::build(ls, event_id, started, shared.home.as_bytes());
     let path = shared.dir.join("index.bin");
-    if save && let Err(e) = idx.save(&path) {
+    if let Err(e) = idx.save(&path) {
         log(format!("save failed: {e}"));
     }
     log(format!("indexed {} entries in {:.2?}", idx.n, t.elapsed()));
     release_memory();
-    if !save {
-        return idx;
-    }
     // Re-map from the file so the index is clean, evictable page cache
     // rather than anonymous memory.
     Index::load(&path).unwrap_or(idx)
@@ -493,12 +497,12 @@ fn release_memory() {
 
 fn compact(shared: &Shared) {
     let t = Instant::now();
-    let (ls, eid) = {
+    let (ls, eid, synced) = {
         let g = shared.live.read().unwrap();
         let live = g.as_ref().unwrap();
-        (live.to_listings(), live.event_id)
+        (live.to_listings(), live.event_id, live.synced_at)
     };
-    let idx = Index::build(ls, eid, shared.home.as_bytes());
+    let idx = Index::build(ls, eid, synced, shared.home.as_bytes());
     let path = shared.dir.join("index.bin");
     if let Err(e) = idx.save(&path) {
         log(format!("save failed: {e}"));
@@ -508,6 +512,42 @@ fn compact(shared: &Shared) {
     *shared.live.write().unwrap() = Some(Live::new(idx));
     release_memory();
     log(format!("compacted to {n} entries in {:.2?}", t.elapsed()));
+}
+
+/// FSEvents lost track of / (dropped events, or no history back to our
+/// save): relist every folder modified since we were last in sync, plus the
+/// folders of indexed text files edited since (an edit in place doesn't
+/// touch its folder). Seconds, instead of recrawling the whole disk.
+fn relist_changed(shared: &Shared, why: &str, flags: u32) {
+    let t = Instant::now();
+    let started = crate::query::now_secs();
+    let since = {
+        let g = shared.live.read().unwrap();
+        g.as_ref().unwrap().synced_at
+    };
+    // synced_at 0 (unknown) relists everything: a full crawl, done in place.
+    let from = since.saturating_sub(SYNC_MARGIN);
+    let mut dirs = {
+        let g = shared.live.read().unwrap();
+        g.as_ref().unwrap().changed_dirs(from)
+    };
+    dirs.extend(shared.content.read().unwrap().changed_dirs(from));
+    dirs.sort();
+    dirs.dedup();
+    let stat_time = t.elapsed();
+    // One folder per lock hold, so searches keep answering meanwhile.
+    for d in &dirs {
+        shared.live.write().unwrap().as_mut().unwrap().apply_dir(d, false);
+    }
+    let trees = {
+        let mut g = shared.live.write().unwrap();
+        let live = g.as_mut().unwrap();
+        live.synced_at = started;
+        std::mem::take(&mut live.trees)
+    };
+    let n = dirs.len();
+    let _ = shared.content_tx.send((dirs, trees));
+    log(format!("FSEvents lost track of / ({why}, flags {flags:#x}): relisted {n} folders changed since {from} in {:.2?} ({stat_time:.2?} checking)", t.elapsed()));
 }
 
 fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
@@ -532,6 +572,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                 }
                 if e.flags & HISTORY_DONE != 0 {
                     log("replay done");
+                    shared.replaying.store(false, Ordering::Relaxed);
                     continue;
                 }
                 let mut p = e.path;
@@ -562,13 +603,11 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                     f if f & USER_DROPPED != 0 => "events dropped before we read them",
                     _ => "history unavailable",
                 };
-                log(format!("rescanning / ({why}, flags {root_flags:#x})"));
-                let id = unsafe { fsevents::FSEventsGetCurrentEventId() };
-                let base = full_build(shared, id, shared.owner());
-                *shared.live.write().unwrap() = Some(Live::new(base));
-                let _ = shared.content_tx.send((Vec::new(), vec![shared.home.as_bytes().to_vec()]));
-                last_save = Instant::now();
-                continue;
+                relist_changed(shared, why, root_flags);
+            } else if !shared.replaying.load(Ordering::Relaxed) {
+                // Everything up to this batch is applied (a change's event can
+                // trail it by the stream latency; relisting keeps a margin).
+                shared.live.write().unwrap().as_mut().unwrap().synced_at = crate::query::now_secs();
             }
         }
         if let Some(l) = shared.live.read().unwrap().as_ref() {

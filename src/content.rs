@@ -719,6 +719,28 @@ impl Content {
         todo
     }
 
+    /// Folders holding an indexed file that changed (or went away) since
+    /// `since`: an edit in place leaves its folder's mtime alone, so lost
+    /// FSEvents history is recovered for the content index by an lstat per
+    /// indexed file.
+    pub fn changed_dirs(&self, since: u32) -> Vec<Vec<u8>> {
+        let pool = crate::live::stat_pool();
+        let mut out: Vec<Vec<u8>> = pool.install(|| {
+            self.segs
+                .par_iter()
+                .flat_map_iter(|s| (0..s.ndocs as u32).filter(|&d| !s.is_dead(d)).map(move |d| (s, d)))
+                .filter(|&(s, d)| crate::live::lstat(s.path(d)).is_none_or(|o| o.mtime >= since || o.size != s.size()[d as usize]))
+                .map(|(s, d)| {
+                    let p = s.path(d);
+                    p[..p.iter().rposition(|&b| b == b'/').unwrap_or(0).max(1)].to_vec()
+                })
+                .collect()
+        });
+        out.sort();
+        out.dedup();
+        out
+    }
+
     pub fn alloc_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id - 1

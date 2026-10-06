@@ -40,6 +40,8 @@ pub struct Live {
     pub trees: Vec<Vec<u8>>,
     /// The last name search's scored names, reused while you type.
     pub names_cache: crate::query::NameCache,
+    /// Wall-clock second up to which every change is known applied.
+    pub synced_at: u32,
 }
 
 pub enum Applied {
@@ -53,7 +55,8 @@ impl Live {
         base.prefault();
         let words = base.n.div_ceil(64);
         let event_id = base.event_id;
-        Live { base, dead: vec![0; words], dead_count: 0, over: BTreeMap::new(), event_id, trees: Vec::new(), names_cache: Default::default() }
+        let synced_at = base.synced_at;
+        Live { base, dead: vec![0; words], dead_count: 0, over: BTreeMap::new(), event_id, trees: Vec::new(), names_cache: Default::default(), synced_at }
     }
 
     #[inline]
@@ -205,6 +208,37 @@ impl Live {
         });
     }
 
+    /// Folders whose listing may have changed since `since` (a wall-clock
+    /// second): adding, removing or renaming an entry bumps its folder's
+    /// mtime. One lstat per folder, in parallel, under a read lock;
+    /// relisting the few that changed is `apply_dir`'s job. This is how lost
+    /// FSEvents history is recovered without crawling the whole disk.
+    pub fn changed_dirs(&self, since: u32) -> Vec<Vec<u8>> {
+        use rayon::prelude::*;
+        let idx = &self.base;
+        let de = idx.dir_entry();
+        let check = |p: &[u8]| !walk::blocked(p) && lstat(p).is_some_and(|o| o.mtime >= since);
+        let pool = stat_pool();
+        let mut out: Vec<Vec<u8>> = pool.install(|| {
+            (1..idx.d)
+                .into_par_iter()
+                .with_min_len(1024)
+                .filter(|&k| !self.is_dead(de[k]))
+                .map_init(Vec::new, |buf, k| {
+                    idx.path(de[k] as usize, buf);
+                    check(buf).then(|| buf.clone())
+                })
+                .flatten()
+                .collect()
+        });
+        out.extend(self.over.iter().filter(|(p, o)| o.kind & 3 == KIND_DIR && o.kind & FLAG_MOUNT == 0 && check(p)).map(|(p, _)| p.clone()));
+        if lstat(b"/").is_some_and(|o| o.mtime >= since) {
+            out.push(b"/".to_vec());
+        }
+        out.sort();
+        out
+    }
+
     /// Everything alive, as listings for Index::build.
     pub fn to_listings(&self) -> Vec<Listing> {
         let mut by_parent: HashMap<&[u8], Vec<(&[u8], OEnt)>> = HashMap::new();
@@ -256,6 +290,11 @@ impl Live {
     }
 }
 
+/// Threads for bulk lstat: path lookups scale further than opens do.
+pub fn stat_pool() -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new().num_threads(12).start_handler(|_| crate::no_materialize()).build().unwrap()
+}
+
 /// Visit every entry of a scan with its full path.
 pub fn for_each_path(ls: &[Listing], root: &[u8], mut f: impl FnMut(Vec<u8>, &RawEnt)) {
     let mut by_id: HashMap<u32, &Listing> = HashMap::with_capacity(ls.len());
@@ -304,7 +343,7 @@ fn subtree_bounds(path: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (lo, hi)
 }
 
-fn lstat(path: &[u8]) -> Option<OEnt> {
+pub fn lstat(path: &[u8]) -> Option<OEnt> {
     let c = std::ffi::CString::new(path).ok()?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::lstat(c.as_ptr(), &mut st) } != 0 {
