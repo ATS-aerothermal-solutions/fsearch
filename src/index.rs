@@ -303,6 +303,14 @@ impl Index {
         std::fs::rename(tmp, path)
     }
 
+    /// The event id a saved index is current as of, from its header alone.
+    pub fn saved_event_id(path: &Path) -> Option<u64> {
+        use std::io::Read;
+        let mut h = [0u8; 48];
+        std::fs::File::open(path).ok()?.read_exact(&mut h).ok()?;
+        (&h[..8] == MAGIC).then(|| u64::from_le_bytes(h[40..48].try_into().unwrap()))
+    }
+
     pub fn load(path: &Path) -> Option<Index> {
         let f = std::fs::File::open(path).ok()?;
         Index::from_map(unsafe { Mmap::map(&f) }.ok()?)

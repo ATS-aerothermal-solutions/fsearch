@@ -3,7 +3,7 @@
 //! that links this crate.
 
 use crate::content::{self, Content, Grep, GrepResult};
-use crate::fsevents::{self, HISTORY_DONE, MUST_SCAN_SUBDIRS};
+use crate::fsevents::{self, HISTORY_DONE, KERNEL_DROPPED, MUST_SCAN_SUBDIRS, USER_DROPPED};
 use crate::index::Index;
 use crate::live::{Applied, Live};
 use crate::query::{Query, Searcher};
@@ -13,7 +13,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 const COMPACT_PENDING: usize = 200_000;
@@ -23,6 +23,8 @@ const COMPACT_EVERY: Duration = Duration::from_secs(12 * 3600);
 const SCAN_THREADS: usize = 8;
 const CONTENT_QUIET: Duration = Duration::from_secs(2);
 const CONTENT_MAX_WAIT: Duration = Duration::from_secs(300);
+/// How often a follower checks whether it can take over or reload.
+const FOLLOW_EVERY: Duration = Duration::from_secs(10);
 
 pub struct Options {
     /// Where the index lives (`index.bin`, `content/`).
@@ -57,6 +59,8 @@ pub struct Status {
     pub content_bytes: usize,
     pub content_pending: usize,
     pub full_disk_access: bool,
+    /// Writes the index files (false: following another process's).
+    pub owner: bool,
 }
 
 #[derive(Clone)]
@@ -74,8 +78,21 @@ struct Shared {
     save_requested: AtomicBool,
     /// (dirs, trees) for the content worker to re-sync.
     content_tx: Sender<(Vec<Vec<u8>>, Vec<Vec<u8>>)>,
+    content_rx: Mutex<Option<Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>>>,
     content_pending: AtomicUsize,
-    _lock: std::fs::File,
+    /// Holding `lock`: this engine writes the index files. Another process
+    /// may own them (the daemon, an app); then this one follows: it reads
+    /// the saved index, keeps it live in memory, and takes over when the
+    /// owner goes away.
+    owner: AtomicBool,
+    lock: std::fs::File,
+    stream: Mutex<Option<fsevents::Stream>>,
+    /// Follower: content dir mtime when its segments were last opened.
+    content_seen: Mutex<Option<std::time::SystemTime>>,
+}
+
+fn try_lock(f: &std::fs::File) -> bool {
+    unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(f), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
 
 fn log(msg: impl AsRef<str>) {
@@ -110,9 +127,7 @@ impl Engine {
         // One writer per index: a second one would race index writes. The
         // lock dies with the process.
         let lock = std::fs::File::create(opts.dir.join("daemon.lock")).map_err(|e| e.to_string())?;
-        if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err("another fsearch engine owns this index".into());
-        }
+        let owner = try_lock(&lock);
         let skip: Vec<Vec<u8>> = match opts.skip {
             Some(v) => v.into_iter().map(|p| p.as_os_str().as_bytes().to_vec()).collect(),
             None if has_full_disk_access() && std::env::var_os("FSEARCH_RESTRICT").is_none() => Vec::new(),
@@ -125,42 +140,56 @@ impl Engine {
             let _ = walk::SKIP.set(skip);
         }
         let dir = opts.dir;
-        let base = Index::load(&dir.join("index.bin"));
-        // Watch before scanning so nothing that changes mid-scan is missed;
-        // replaying it afterwards is harmless because diffs are idempotent.
-        let since = match &base {
-            Some(b) if b.event_id != 0 => b.event_id,
-            _ => unsafe { fsevents::FSEventsGetCurrentEventId() },
-        };
         let (tx, rx) = std::sync::mpsc::channel();
-        fsevents::watch(since, 0.1, tx.clone());
         let (ctx, crx) = std::sync::mpsc::channel();
+        let content = if owner { Content::open(dir.join("content")) } else { Content::open_shared(dir.join("content")) };
         let shared = Arc::new(Shared {
             live: RwLock::new(None),
-            content: RwLock::new(Content::open(dir.join("content"))),
+            content: RwLock::new(content),
             home: opts.home,
             dir,
             wake: tx,
             save_requested: AtomicBool::new(false),
             content_tx: ctx,
+            content_rx: Mutex::new(Some(crx)),
             content_pending: AtomicUsize::new(0),
-            _lock: lock,
+            owner: AtomicBool::new(owner),
+            lock,
+            stream: Mutex::new(None),
+            content_seen: Mutex::new(None),
         });
+        let base = Index::load(&shared.dir.join("index.bin"));
+        let since = match &base {
+            Some(b) if b.event_id != 0 => b.event_id,
+            _ => unsafe { fsevents::FSEventsGetCurrentEventId() },
+        };
+        if owner {
+            // Watch before scanning so nothing that changes mid-scan is
+            // missed; replaying it afterwards is harmless (diffs are idempotent).
+            shared.watch(since);
+        }
         let s = shared.clone();
         spawn("fsearch-apply", move || {
             let base = match base {
                 Some(b) => {
                     log(format!("loaded {} entries, replaying events since {}", b.n, b.event_id));
+                    if !owner {
+                        s.watch(b.event_id);
+                    }
                     b
                 }
-                None => full_build(&s, since),
+                None if owner => full_build(&s, since, true),
+                None => {
+                    // The owner is building it; follow once it exists.
+                    let b = wait_for_index(&s.dir);
+                    s.watch(b.event_id);
+                    b
+                }
             };
             *s.live.write().unwrap() = Some(Live::new(base));
-            // Content: reconcile all of home once (cheap when nothing
-            // changed), then follow along with the name index's changes.
-            let _ = s.content_tx.send((Vec::new(), vec![s.home.as_bytes().to_vec()]));
-            let s3 = s.clone();
-            spawn("fsearch-content", move || content_loop(&s3, crx));
+            if owner {
+                start_content(&s);
+            }
             apply_loop(&s, rx);
         });
         Ok(Engine { s: shared })
@@ -231,6 +260,7 @@ impl Engine {
             content_bytes: c.bytes(),
             content_pending: self.s.content_pending.load(Ordering::Relaxed),
             full_disk_access: walk::SKIP.get().is_none(),
+            owner: self.s.owner(),
         }
     }
 
@@ -242,6 +272,71 @@ impl Engine {
 }
 
 const INDEXING: &str = "indexing (first run scans the whole disk, ~20s)";
+
+impl Shared {
+    fn owner(&self) -> bool {
+        self.owner.load(Ordering::Relaxed)
+    }
+
+    /// (Re)start the FSEvents stream from `since`, replacing any old one.
+    fn watch(&self, since: u64) {
+        let new = fsevents::watch(since, 0.1, self.wake.clone());
+        *self.stream.lock().unwrap() = Some(new);
+    }
+
+    /// A follower picks up what the owner wrote: a newer name-index save
+    /// (replaying FSEvents from it) and content segment changes.
+    fn follow(&self) {
+        let path = self.dir.join("index.bin");
+        let saved = Index::saved_event_id(&path).unwrap_or(0);
+        let ours = self.live.read().unwrap().as_ref().map_or(0, |l| l.base.event_id);
+        if saved > ours && let Some(base) = Index::load(&path) {
+            log(format!("following the owner's save: {} entries, replaying since {}", base.n, base.event_id));
+            self.watch(base.event_id);
+            *self.live.write().unwrap() = Some(Live::new(base));
+        }
+        let cdir = self.dir.join("content");
+        let changed = std::fs::metadata(&cdir).and_then(|m| m.modified()).ok();
+        let mut seen = self.content_seen.lock().unwrap();
+        if changed != *seen {
+            *seen = changed;
+            *self.content.write().unwrap() = Content::open_shared(cdir);
+        }
+    }
+}
+
+fn start_content(s: &Arc<Shared>) {
+    let Some(rx) = s.content_rx.lock().unwrap().take() else { return };
+    // Reconcile all of home once (cheap when nothing changed), then follow
+    // along with the name index's changes.
+    let _ = s.content_tx.send((Vec::new(), vec![s.home.as_bytes().to_vec()]));
+    let s = s.clone();
+    spawn("fsearch-content", move || content_loop(&s, rx));
+}
+
+/// A follower takes over the index files once their owner is gone.
+fn try_upgrade(s: &Arc<Shared>) -> bool {
+    if s.owner() {
+        return true;
+    }
+    if !try_lock(&s.lock) {
+        return false;
+    }
+    s.owner.store(true, Ordering::Relaxed);
+    log("took over the index from a previous owner");
+    *s.content.write().unwrap() = Content::open(s.dir.join("content"));
+    start_content(s);
+    true
+}
+
+fn wait_for_index(dir: &Path) -> Index {
+    loop {
+        if let Some(b) = Index::load(&dir.join("index.bin")) {
+            return b;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
 
 /// Folders macOS guards with a consent prompt (or that hold other volumes).
 pub fn gated(home: &str) -> Vec<Vec<u8>> {
@@ -368,16 +463,19 @@ fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
     }
 }
 
-fn full_build(shared: &Shared, event_id: u64) -> Index {
+fn full_build(shared: &Shared, event_id: u64, save: bool) -> Index {
     let t = Instant::now();
     let (ls, _) = walk::scan(b"/", SCAN_THREADS);
     let idx = Index::build(ls, event_id, shared.home.as_bytes());
     let path = shared.dir.join("index.bin");
-    if let Err(e) = idx.save(&path) {
+    if save && let Err(e) = idx.save(&path) {
         log(format!("save failed: {e}"));
     }
     log(format!("indexed {} entries in {:.2?}", idx.n, t.elapsed()));
     release_memory();
+    if !save {
+        return idx;
+    }
     // Re-map from the file so the index is clean, evictable page cache
     // rather than anonymous memory.
     Index::load(&path).unwrap_or(idx)
@@ -412,8 +510,9 @@ fn compact(shared: &Shared) {
     log(format!("compacted to {n} entries in {:.2?}", t.elapsed()));
 }
 
-fn apply_loop(shared: &Shared, rx: Receiver<Vec<fsevents::Event>>) {
+fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     let mut last_save = Instant::now();
+    let mut last_follow = Instant::now();
     loop {
         let mut events = match rx.recv_timeout(Duration::from_secs(60)) {
             Ok(b) => b,
@@ -425,9 +524,12 @@ fn apply_loop(shared: &Shared, rx: Receiver<Vec<fsevents::Event>>) {
         }
         if !events.is_empty() {
             let mut dirs: HashMap<Vec<u8>, bool> = HashMap::new();
-            let mut max_id = 0;
+            let (mut max_id, mut root_flags) = (0, 0);
             for e in events {
                 max_id = max_id.max(e.id);
+                if e.path == b"/" && e.flags & MUST_SCAN_SUBDIRS != 0 {
+                    root_flags |= e.flags;
+                }
                 if e.flags & HISTORY_DONE != 0 {
                     log("replay done");
                     continue;
@@ -455,14 +557,28 @@ fn apply_loop(shared: &Shared, rx: Receiver<Vec<fsevents::Event>>) {
             trees.extend(rec.into_iter().map(|(p, _)| p));
             let _ = shared.content_tx.send((flat.into_iter().map(|(p, _)| p).collect(), trees));
             if rebuild {
-                log("history lost at /, rescanning");
+                let why = match root_flags {
+                    f if f & KERNEL_DROPPED != 0 => "kernel dropped events",
+                    f if f & USER_DROPPED != 0 => "events dropped before we read them",
+                    _ => "history unavailable",
+                };
+                log(format!("rescanning / ({why}, flags {root_flags:#x})"));
                 let id = unsafe { fsevents::FSEventsGetCurrentEventId() };
-                let base = full_build(shared, id);
+                let base = full_build(shared, id, shared.owner());
                 *shared.live.write().unwrap() = Some(Live::new(base));
                 let _ = shared.content_tx.send((Vec::new(), vec![shared.home.as_bytes().to_vec()]));
                 last_save = Instant::now();
                 continue;
             }
+        }
+        if !shared.owner() && last_follow.elapsed() > FOLLOW_EVERY {
+            last_follow = Instant::now();
+            if !try_upgrade(shared) {
+                shared.follow();
+            }
+        }
+        if !shared.owner() {
+            continue;
         }
         let (pending, stale) = {
             let g = shared.live.read().unwrap();

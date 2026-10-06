@@ -641,14 +641,23 @@ pub struct Content {
 }
 
 impl Content {
-    pub fn open(dir: PathBuf) -> Content {
-        std::fs::create_dir_all(&dir).ok();
+    /// Open the segments the manifest lists, without touching anything: the
+    /// view of an engine that follows another process's index.
+    pub fn open_shared(dir: PathBuf) -> Content {
         let manifest: Vec<u64> = std::fs::read_to_string(dir.join("manifest"))
             .unwrap_or_default()
             .split_whitespace()
             .filter_map(|s| s.parse().ok())
             .collect();
         let segs: Vec<Segment> = manifest.iter().filter_map(|&id| Segment::load(&dir, id)).collect();
+        let next_id = segs.iter().map(|s| s.id + 1).max().unwrap_or(1);
+        Content { dir, segs, next_id }
+    }
+
+    /// Open as the owner: also delete what the manifest doesn't list.
+    pub fn open(dir: PathBuf) -> Content {
+        std::fs::create_dir_all(&dir).ok();
+        let Content { dir, segs, next_id } = Content::open_shared(dir);
         // Anything not loaded (old format, crashed build) is garbage.
         let keep: Vec<String> = segs.iter().flat_map(|s| [format!("seg-{:06}.fsc", s.id), format!("seg-{:06}.dead", s.id)]).collect();
         for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
@@ -657,7 +666,6 @@ impl Content {
                 let _ = std::fs::remove_file(e.path());
             }
         }
-        let next_id = segs.iter().map(|s| s.id + 1).max().unwrap_or(1);
         Content { dir, segs, next_id }
     }
 

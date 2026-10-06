@@ -4,6 +4,8 @@ use std::ffi::{CStr, c_void};
 use std::sync::mpsc::Sender;
 
 pub const MUST_SCAN_SUBDIRS: u32 = 0x1;
+pub const USER_DROPPED: u32 = 0x2;
+pub const KERNEL_DROPPED: u32 = 0x4;
 pub const HISTORY_DONE: u32 = 0x10;
 const CREATE_FLAG_IGNORE_SELF: u32 = 0x8;
 const CREATE_FLAG_NO_DEFER: u32 = 0x2;
@@ -38,6 +40,9 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn FSEventStreamSetDispatchQueue(s: *mut c_void, q: *mut c_void);
     fn FSEventStreamStart(s: *mut c_void) -> u8;
+    fn FSEventStreamStop(s: *mut c_void);
+    fn FSEventStreamInvalidate(s: *mut c_void);
+    fn FSEventStreamRelease(s: *mut c_void);
     pub fn FSEventsGetCurrentEventId() -> u64;
 }
 
@@ -63,12 +68,31 @@ extern "C" fn on_events(_s: *mut c_void, info: *mut c_void, n: usize, paths: *mu
     let _ = tx.send(batch);
 }
 
-/// Start watching `/` from `since` (an event id, or SINCE_NOW). Batches of
-/// directory-level events arrive on `tx`; the stream lives for the process.
-pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>) {
+/// A running stream; dropping it stops it.
+pub struct Stream(*mut c_void);
+
+// The stream is only started and stopped, never shared mid-call.
+unsafe impl Send for Stream {}
+unsafe impl Sync for Stream {}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        unsafe {
+            FSEventStreamStop(self.0);
+            FSEventStreamInvalidate(self.0);
+            FSEventStreamRelease(self.0);
+        }
+    }
+}
+
+/// Watch `/` from `since` (an event id). Batches of directory-level events
+/// arrive on `tx` until the returned stream is dropped.
+pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
     unsafe {
         let root = CFStringCreateWithCString(std::ptr::null(), c"/".as_ptr(), 0x0800_0100);
         let arr = CFArrayCreate(std::ptr::null(), &root, 1, &kCFTypeArrayCallBacks as *const c_void);
+        // The sender is leaked: a callback may still be in flight when the
+        // stream stops, and streams are replaced rarely.
         let ctx = Context {
             version: 0,
             info: Box::into_raw(Box::new(tx)) as *mut c_void,
@@ -80,5 +104,6 @@ pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>) {
         let q = dispatch_queue_create(c"fsearch.fsevents".as_ptr(), std::ptr::null());
         FSEventStreamSetDispatchQueue(s, q);
         FSEventStreamStart(s);
+        Stream(s)
     }
 }

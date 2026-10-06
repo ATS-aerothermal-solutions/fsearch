@@ -15,6 +15,14 @@ pub fn socket_path(dir: &Path) -> PathBuf {
 }
 
 pub fn serve(dir: PathBuf, home: String) {
+    // One daemon per socket. (The engine's own lock decides who writes the
+    // index: an app embedding fsearch may own it while the daemon follows.)
+    std::fs::create_dir_all(&dir).ok();
+    let Ok(lock) = std::fs::File::create(dir.join("socket.lock")) else { return };
+    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        eprintln!("{} another fsearch daemon is running", fsearch::query::now_secs());
+        return;
+    }
     let engine = match Engine::start(Options { dir: dir.clone(), home, skip: None }) {
         Ok(e) => e,
         Err(e) => {
@@ -90,6 +98,7 @@ fn run(v: &Value, engine: &Engine) -> Result<Value, String> {
                 "content_bytes": s.content_bytes,
                 "content_pending": s.content_pending,
                 "full_disk_access": s.full_disk_access,
+                "owner": s.owner,
             }))
         }
         "search" => {
