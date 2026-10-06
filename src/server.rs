@@ -23,7 +23,7 @@ const COMPACT_PENDING: usize = 200_000;
 const COMPACT_EVERY: Duration = Duration::from_secs(12 * 3600);
 const SCAN_THREADS: usize = 8;
 const CONTENT_QUIET: Duration = Duration::from_secs(2);
-const CONTENT_MAX_WAIT: Duration = Duration::from_secs(30);
+const CONTENT_MAX_WAIT: Duration = Duration::from_secs(300);
 
 pub struct Shared {
     live: RwLock<Option<Live>>,
@@ -134,9 +134,9 @@ fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
         .unwrap();
     let home = shared.home.as_bytes().to_vec();
     // Per-folder debounce: a folder is processed 2s after its last change,
-    // or 30s after its first pending one if it never goes quiet. A file you
-    // save lands in ~2s; files apps rewrite every second cost one reindex
-    // per half minute.
+    // or 5 min after its first pending one if it never goes quiet. A file you
+    // save lands in ~2s; files apps rewrite every second (state, logs) cost
+    // one reindex per 5 min instead of one per event batch.
     let mut pending: HashMap<(Vec<u8>, bool), (Instant, Instant)> = HashMap::new();
     loop {
         let wait = if pending.is_empty() { Duration::from_secs(3600) } else { Duration::from_millis(250) };

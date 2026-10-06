@@ -35,7 +35,9 @@ VPN) that tax every `open()` (~19 µs per directory); file reads peak at
 Started from a terminal that has Full Disk Access, the daemon inherits it
 and indexes everything. Run any other way (e.g. as a login item) it needs its
 own grant: System Settings > Privacy & Security > Full Disk Access > add
-`~/.local/bin/fsearch`, then `fsearch install --login`. Without the grant
+`~/.local/bin/fsearch`, then `fsearch install --login` (an ad-hoc signed
+build's grant is tied to that exact binary, so re-grant after rebuilding, or
+sign it with a stable identity). Without the grant
 it detects that at startup and stays out of consent-gated folders
 (Desktop, Documents, Downloads, iCloud, app containers, CloudStorage,
 /Volumes) instead of blocking on a privacy prompt. It never downloads iCloud
@@ -68,7 +70,7 @@ placeholders and never blocks on FIFOs.
   planned from their syntax tree), the postings pick candidates, and candidates
   are read fresh from disk and matched, so results are never stale.
   Kept in sync by the same directory diffs as the name index, debounced
-  (2 s of quiet, at most 30 s) so files apps rewrite constantly cost little.
+  (2 s of quiet, at most 5 min) so files apps rewrite constantly cost little.
   `in:` outside the indexed area (e.g. `in:/etc`) greps the files the name
   index lists there instead of crawling.
 
