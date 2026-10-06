@@ -27,6 +27,8 @@ pub struct Live {
     /// Paths of directories added or removed since last drained; the
     /// content index re-syncs these whole subtrees.
     pub trees: Vec<Vec<u8>>,
+    /// The last name search's scored names, reused while you type.
+    pub names_cache: crate::query::NameCache,
 }
 
 pub enum Applied {
@@ -40,7 +42,7 @@ impl Live {
         base.prefault();
         let words = base.n.div_ceil(64);
         let event_id = base.event_id;
-        Live { base, dead: vec![0; words], dead_count: 0, over: BTreeMap::new(), event_id, trees: Vec::new() }
+        Live { base, dead: vec![0; words], dead_count: 0, over: BTreeMap::new(), event_id, trees: Vec::new(), names_cache: Default::default() }
     }
 
     #[inline]

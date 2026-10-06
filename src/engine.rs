@@ -571,6 +571,9 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                 continue;
             }
         }
+        if let Some(l) = shared.live.read().unwrap().as_ref() {
+            l.names_cache.trim_if_idle(Duration::from_secs(60));
+        }
         if !shared.owner() && last_follow.elapsed() > FOLLOW_EVERY {
             last_follow = Instant::now();
             if !try_upgrade(shared) {

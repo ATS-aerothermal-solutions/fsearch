@@ -5,7 +5,7 @@ use crate::live::Live;
 use crate::walk::{FLAG_HIDDEN, KIND_DIR, KIND_FILE, KIND_LINK};
 use rayon::prelude::*;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
@@ -369,57 +369,48 @@ fn bonus(prev: Class, cur: Class) -> i32 {
 /// fzf-v1 style: leftmost-ending match, shrunk from the right, then scored
 /// with boundary/camel/consecutive bonuses. Returns None when no match.
 pub fn fuzzy_score(name: &[u8], q: &[u8]) -> Option<i32> {
-    let mut j = 0;
-    let mut end = usize::MAX;
-    for (i, &b) in name.iter().enumerate() {
-        if fold(b) == q[j] {
-            j += 1;
-            if j == q.len() {
-                end = i;
-                break;
-            }
-        }
+    // Leftmost-ending match: jump to each query byte in turn (memchr is
+    // SIMD; most names fail on the first or second byte).
+    let mut end = 0;
+    let mut from = 0;
+    for &c in q {
+        end = from + find_folded(&name[from..], c)?;
+        from = end + 1;
     }
-    if end == usize::MAX {
-        return None;
+    if q.len() == 1 {
+        return Some(single_score(name, end));
     }
-    let mut start = end;
-    let mut j = q.len();
-    for i in (0..=end).rev() {
-        if fold(name[i]) == q[j - 1] {
-            j -= 1;
-            if j == 0 {
-                start = i;
-                break;
-            }
-        }
+    // Shrink from the right: the latest start that still ends at `end`.
+    let mut start = end + 1;
+    for &c in q.iter().rev() {
+        start = rfind_folded(&name[..start], c)?;
     }
+    // Score the greedy match from `start`, jumping between matched bytes:
+    // each gap costs GAP_START then GAP_EXT per byte, a run of consecutive
+    // matches carries its strongest boundary bonus along.
     let mut score = 0;
-    let mut prev = if start == 0 { Class::Delim } else { class(name[start - 1]) };
-    let (mut consec, mut first_bonus, mut in_gap, mut k) = (0, 0, false, 0);
-    for i in start..=end {
-        let c = class(name[i]);
-        if k < q.len() && fold(name[i]) == q[k] {
-            let mut b = bonus(prev, c);
-            if consec == 0 {
-                first_bonus = b;
-            } else {
-                if b >= BONUS_BOUNDARY && b > first_bonus {
-                    first_bonus = b;
-                }
-                b = b.max(first_bonus).max(BONUS_CONSEC);
+    let (mut at, mut first_bonus) = (start, 0);
+    for (k, &c) in q.iter().enumerate() {
+        let mut run = false;
+        if k > 0 {
+            let last = at;
+            at = last + 1 + find_folded(&name[last + 1..=end], c)?;
+            run = at == last + 1;
+            if !run {
+                score += GAP_START + (at - last - 2) as i32 * GAP_EXT;
             }
-            score += SCORE_MATCH + if k == 0 { b * 2 } else { b };
-            consec += 1;
-            in_gap = false;
-            k += 1;
-        } else {
-            score += if in_gap { GAP_EXT } else { GAP_START };
-            in_gap = true;
-            consec = 0;
-            first_bonus = 0;
         }
-        prev = c;
+        let prev = if at == 0 { Class::Delim } else { class(name[at - 1]) };
+        let mut b = bonus(prev, class(name[at]));
+        if run {
+            if b >= BONUS_BOUNDARY && b > first_bonus {
+                first_bonus = b;
+            }
+            b = b.max(first_bonus).max(BONUS_CONSEC);
+        } else {
+            first_bonus = b;
+        }
+        score += SCORE_MATCH + if k == 0 { b * 2 } else { b };
     }
     // Whole-name and stem matches are what people mean most of the time. A
     // leading dot doesn't count: "zshrc" means ~/.zshrc.
@@ -434,6 +425,38 @@ pub fn fuzzy_score(name: &[u8], q: &[u8]) -> Option<i32> {
         score += 30;
     }
     Some(score - (name.len() as i32).min(80) / 3)
+}
+
+/// First byte of `s` that folds to `c` (an already-lowercased query byte).
+#[inline(always)]
+fn find_folded(s: &[u8], c: u8) -> Option<usize> {
+    if c.is_ascii_lowercase() { memchr::memchr2(c, c - 32, s) } else { memchr::memchr(c, s) }
+}
+
+/// Last byte of `s` that folds to `c`.
+#[inline(always)]
+fn rfind_folded(s: &[u8], c: u8) -> Option<usize> {
+    if c.is_ascii_lowercase() { memchr::memrchr2(c, c - 32, s) } else { memchr::memrchr(c, s) }
+}
+
+/// `fuzzy_score` for a one-byte query matched at `i`: the general scoring
+/// loop collapses to one step.
+#[inline]
+fn single_score(name: &[u8], i: usize) -> i32 {
+    let prev = if i == 0 { Class::Delim } else { class(name[i - 1]) };
+    let mut score = SCORE_MATCH + bonus(prev, class(name[i])) * 2;
+    let off = (name.len() > 1 && name[0] == b'.') as usize;
+    if i == off {
+        let stem = name.iter().rposition(|&b| b == b'.').filter(|&p| p > off).unwrap_or(name.len());
+        score += if i + 1 == name.len() {
+            100
+        } else if i + 1 == stem {
+            80
+        } else {
+            30
+        };
+    }
+    score - (name.len() as i32).min(80) / 3
 }
 
 /// Score a token against a name, honoring its mode.
@@ -457,34 +480,61 @@ fn token_matches(name: &[u8], t: &Token) -> bool {
     }
 }
 
+/// Top k by (score, then lower entry index): a total order, so the result
+/// does not depend on which thread saw which entry first.
 struct TopK {
     k: usize,
-    heap: BinaryHeap<Reverse<(i32, Reverse<u32>)>>,
+    heap: BinaryHeap<Reverse<u64>>,
+}
+
+#[inline(always)]
+fn key(score: i32, i: u32) -> u64 {
+    (((score as i64 - i32::MIN as i64) as u64) << 32) | (!i) as u64
 }
 
 impl TopK {
     fn new(k: usize) -> TopK {
         TopK { k, heap: BinaryHeap::with_capacity(k + 1) }
     }
+    /// Keys at or below this cannot get in.
     #[inline]
-    fn floor(&self) -> i32 {
-        if self.heap.len() < self.k { i32::MIN } else { self.heap.peek().unwrap().0.0 }
+    fn floor(&self) -> u64 {
+        if self.heap.len() < self.k { 0 } else { self.heap.peek().map_or(u64::MAX, |r| r.0) }
     }
     #[inline]
-    fn push(&mut self, s: i32, i: u32) {
+    fn push(&mut self, key: u64) {
         if self.heap.len() < self.k {
-            self.heap.push(Reverse((s, Reverse(i))));
-        } else if s > self.floor() {
+            self.heap.push(Reverse(key));
+        } else if key > self.floor() {
             self.heap.pop();
-            self.heap.push(Reverse((s, Reverse(i))));
+            self.heap.push(Reverse(key));
         }
     }
-    fn merge(mut self, o: TopK) -> TopK {
-        for Reverse((s, Reverse(i))) in o.heap {
-            self.push(s, i);
+}
+
+/// Top `k` over `0..n` items: a few contiguous pieces per thread, each with
+/// its own heap, then one selection over their survivors (merging heaps
+/// pairwise costs more than the scan when `k` is large).
+fn top_k(n: usize, k: usize, visit: impl Fn(std::ops::Range<usize>, &mut TopK) + Sync) -> Vec<Hit> {
+    let pieces = (rayon::current_num_threads() * 4).min(n.max(1));
+    let step = n.div_ceil(pieces).max(1);
+    let mut keys: Vec<u64> = (0..pieces)
+        .into_par_iter()
+        .map(|p| {
+            let mut top = TopK::new(k);
+            visit((p * step).min(n)..((p + 1) * step).min(n), &mut top);
+            top.heap.into_iter().map(|Reverse(x)| x).collect::<Vec<_>>()
+        })
+        .flatten_iter()
+        .collect();
+    if keys.len() > k {
+        if k == 0 {
+            return Vec::new();
         }
-        self
+        keys.select_nth_unstable_by(k - 1, |a, b| b.cmp(a));
+        keys.truncate(k);
     }
+    keys.into_iter().map(|x| Hit { score: ((x >> 32) as i64 + i32::MIN as i64) as i32, idx: !(x as u32), over: None }).collect()
 }
 
 fn ext_ok(name: &[u8], exts: &[Vec<u8>]) -> bool {
@@ -492,6 +542,12 @@ fn ext_ok(name: &[u8], exts: &[Vec<u8>]) -> bool {
     let e = &name[dot + 1..];
     exts.iter().any(|x| x.len() == e.len() && x.iter().zip(e).all(|(&a, &b)| a == fold(b)))
 }
+
+/// Below this many entries carrying a matching name, a query visits just
+/// those entries (via the name -> entries list) instead of every entry.
+const SELECTIVE: usize = 60_000;
+/// Name ids per parallel chunk when scoring names.
+const NAME_CHUNK: usize = 1 << 15;
 
 pub struct Searcher<'a> {
     pub live: &'a Live,
@@ -516,151 +572,129 @@ impl Searcher<'_> {
     }
 
     fn search_base(&self, q: &Query) -> Vec<Hit> {
-        let idx = &self.live.base;
         let Some((lo, hi)) = self.scope_range(q) else { return Vec::new() };
         let pos: Vec<&Token> = q.tokens.iter().filter(|t| !t.negate).collect();
         let neg: Vec<&Token> = q.tokens.iter().filter(|t| t.negate).collect();
-        let all = (1u32 << pos.len()) - 1;
         // Step 1: every name-only predicate, once per distinct name (~2M)
-        // rather than once per entry (~7.5M).
-        let names = self.score_names(q, &pos, &neg);
-        // Per-directory memo: which tokens some ancestor's name matches, and
-        // whether any ancestor hits a negated token. One pass over ~1M dirs
-        // replaces a parent-chain walk per file.
-        let need_dirs = pos.len() > 1 || !neg.is_empty();
-        let dir_tok: Vec<DirMemo> = if need_dirs { self.dir_tokens(&names) } else { Vec::new() };
-        let dir_tok = Pooled(Some(dir_tok));
-        let now = now_secs();
-        let ent_name = idx.ent_name();
-        let kind = idx.kind();
-        let parent = idx.parent();
-        let size = idx.size_raw();
-        let mtime = idx.mtime();
-        let prior = idx.dir_prior();
-        let filt_size = q.size != (0, u64::MAX);
-        let filt_mtime = q.mtime != (0, u32::MAX);
-
-        // Step 2: one sequential pass over entries with a table lookup each.
-        let chunk = 1 << 16;
-        let nchunks = (hi - lo).div_ceil(chunk);
-        let top = (0..nchunks)
-            .into_par_iter()
-            .fold(
-                || (TopK::new(q.limit), Vec::<u8>::new()),
-                |(mut top, mut pbuf), c| {
-                    let a = lo + c * chunk;
-                    let b = (a + chunk).min(hi);
-                    for i in a..b {
-                        let Some(nh) = names.get(ent_name[i]).filter(|h| h.flags & NF_OK != 0) else { continue };
-                        let k = kind[i];
-                        if q.kind.is_some_and(|want| k & 3 != want) {
-                            continue;
-                        }
-                        if filt_size {
-                            let sz = crate::index::dec_size(size[i]);
-                            if sz < q.size.0 || sz > q.size.1 {
-                                continue;
-                            }
-                        }
-                        if filt_mtime && (mtime[i] < q.mtime.0 || mtime[i] > q.mtime.1) {
-                            continue;
-                        }
-                        let p = parent[i] as usize;
-                        let mut score = nh.score as i32;
-                        if need_dirs {
-                            let memo = dir_tok[p];
-                            if memo.bits == u32::MAX || (nh.bits as u32 | memo.bits) & all != all {
-                                continue;
-                            }
-                            for t in 0..pos.len() {
-                                if nh.bits & (1 << t) == 0 {
-                                    // Matched by a folder on the path instead.
-                                    score += memo.best.get(t).map_or(6, |&b| b as i32 * 3 / 4);
-                                }
-                            }
-                        }
-                        if self.live.is_dead(i as u32) {
-                            continue;
-                        }
-                        score += prior[p] as i32 + rank_tweaks(nh.flags, k, mtime[i], now);
-                        if score <= top.floor() {
-                            continue;
-                        }
-                        if let Some(re) = &q.path_re {
-                            idx.path(i, &mut pbuf);
-                            if !re.is_match(&pbuf) {
-                                continue;
-                            }
-                        }
-                        top.push(score, i as u32);
-                    }
-                    (top, pbuf)
-                },
-            )
-            .map(|(t, _)| t)
-            .reduce(|| TopK::new(q.limit), TopK::merge);
-        top.heap.into_iter().map(|Reverse((score, Reverse(idx)))| Hit { idx, score, over: None }).collect()
+        // rather than once per entry (~7.5M); reused while you type.
+        let scored = self.names(q, &pos, &neg);
+        let s = Scan { q, live: self.live, names: &scored.names, npos: pos.len(), need_dirs: pos.len() > 1 || !neg.is_empty(), now: now_secs() };
+        // Step 2: score entries. Few candidates: just the entries carrying a
+        // matching name. Many: one sequential pass over every entry.
+        if scored.names.ok_entries <= SELECTIVE && !FULL_PASS.load(std::sync::atomic::Ordering::Relaxed) {
+            return s.selective(lo, hi);
+        }
+        let memo = if s.need_dirs { Some(scored.memo.get_or_init(|| self.dir_tokens(&scored.names))) } else { None };
+        s.full(lo, hi, memo.map(|m| m.as_slice()))
     }
 
-    /// Score every distinct name against the query's name-only predicates.
-    /// Matches come back sparse (plus a 256 KB membership bitset), so a
-    /// selective query never touches a table the size of the name count.
-    fn score_names(&self, q: &Query, pos: &[&Token], neg: &[&Token]) -> NameTable {
+    /// The name table for this query: cached for a repeat of the last one
+    /// (the second, longer page of results), narrowed from the last one when
+    /// this query only extends it (typing), else scored from scratch.
+    fn names(&self, q: &Query, pos: &[&Token], neg: &[&Token]) -> std::sync::Arc<Scored> {
+        let key = NameKey::of(q);
+        let prev = self.live.names_cache.0.lock().unwrap().clone();
+        if let Some(p) = &prev {
+            if p.key == key {
+                return p.clone();
+            }
+        }
+        let from = prev.as_ref().filter(|p| key.narrows(&p.key)).map(|p| &p.names);
+        let scored = std::sync::Arc::new(Scored { at: std::time::Instant::now(), key, names: self.score_names(q, pos, neg, from), memo: std::sync::OnceLock::new() });
+        *self.live.names_cache.0.lock().unwrap() = Some(scored.clone());
+        scored
+    }
+
+    /// Score distinct names against the query's name-only predicates: every
+    /// name, or only the ones `from` matched. Matches come back sparse (plus
+    /// a 256 KB membership bitset), so a selective query never touches a
+    /// table the size of the name count.
+    fn score_names(&self, q: &Query, pos: &[&Token], neg: &[&Token], from: Option<&NameTable>) -> NameTable {
         let idx = &self.live.base;
         let mask = idx.name_mask();
-        let chunk = 1 << 15;
-        let parts: Vec<Vec<(u32, NameHit)>> = (0..idx.u.div_ceil(chunk))
-            .into_par_iter()
-            .map(|c| {
-                let mut out = Vec::new();
-                for k in c * chunk..((c + 1) * chunk).min(idx.u) {
-                    let m = mask[k];
-                    if !(pos.is_empty() || pos.iter().any(|t| m & t.mask == t.mask)) && neg.is_empty() {
-                        continue;
+        let ne_off = idx.name_ents_off();
+        let score_one = |k: usize, ok_entries: &mut usize| -> Option<NameHit> {
+            let m = mask[k];
+            if !(pos.is_empty() || pos.iter().any(|t| m & t.mask == t.mask)) && neg.is_empty() {
+                return None;
+            }
+            let name = idx.uname(k as u32);
+            let mut h = NameHit { score: 0, bits: 0, flags: name_flags(name), best: [0; 4] };
+            for (t, tok) in pos.iter().enumerate() {
+                if m & tok.mask == tok.mask {
+                    if let Some(s) = token_score(name, tok) {
+                        h.bits |= 1 << t;
+                        let s16 = s.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                        h.score = h.score.saturating_add(s16);
+                        if t < 4 {
+                            h.best[t] = s16.max(0);
+                        }
                     }
-                    let name = idx.uname(k as u32);
-                    let mut h = NameHit { score: 0, bits: 0, flags: name_flags(name), best: [0; 4] };
-                    for (t, tok) in pos.iter().enumerate() {
-                        if m & tok.mask == tok.mask {
-                            if let Some(s) = token_score(name, tok) {
-                                h.bits |= 1 << t;
-                                let s16 = s.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                                h.score = h.score.saturating_add(s16);
-                                if t < 4 {
-                                    h.best[t] = s16.max(0);
+                }
+            }
+            if neg.iter().any(|t| token_matches(name, t)) {
+                h.flags |= NF_NEG;
+            }
+            // As a file match it must hit a token and pass name filters;
+            // as a folder on someone's path, the raw token bits matter.
+            let ok = (pos.is_empty() || h.bits != 0)
+                && h.flags & NF_NEG == 0
+                && (q.exts.is_empty() || ext_ok(name, &q.exts))
+                && q.name_re.as_ref().is_none_or(|re| re.is_match(name));
+            if ok {
+                h.flags |= NF_OK;
+                *ok_entries += (ne_off[k + 1] - ne_off[k]) as usize;
+            }
+            (ok || h.bits != 0 || h.flags & NF_NEG != 0).then_some(h)
+        };
+        // Each chunk of name ids writes its own slice of the bitset and of a
+        // reused dense table. Slots without their bit set are never read, so
+        // the table is never cleared (and never page-faulted in again).
+        let mut bits = vec![0u64; idx.u.div_ceil(64)];
+        let mut dense = DENSE_POOL.lock().unwrap().pop().filter(|d| d.len() == idx.u).unwrap_or_else(|| vec![NameHit::NONE; idx.u]);
+        let counts: Vec<(usize, usize)> = dense
+            .par_chunks_mut(NAME_CHUNK)
+            .zip(bits.par_chunks_mut(NAME_CHUNK / 64))
+            .enumerate()
+            .map(|(c, (slots, words))| {
+                let (a, b) = (c * NAME_CHUNK, ((c + 1) * NAME_CHUNK).min(idx.u));
+                let (mut n, mut ok) = (0usize, 0usize);
+                let mut put = |k: usize, h: NameHit| {
+                    slots[k - a] = h;
+                    words[(k - a) >> 6] |= 1 << (k & 63);
+                    n += 1;
+                };
+                match from {
+                    Some(f) => {
+                        for w in a / 64..b.div_ceil(64) {
+                            let mut m = f.bits[w];
+                            while m != 0 {
+                                let k = w * 64 + m.trailing_zeros() as usize;
+                                if let Some(h) = score_one(k, &mut ok) {
+                                    put(k, h);
                                 }
+                                m &= m - 1;
                             }
                         }
                     }
-                    if neg.iter().any(|t| token_matches(name, t)) {
-                        h.flags |= NF_NEG;
-                    }
-                    // As a file match it must hit a token and pass name filters;
-                    // as a folder on someone's path, the raw token bits matter.
-                    let ok = (pos.is_empty() || h.bits != 0)
-                        && h.flags & NF_NEG == 0
-                        && (q.exts.is_empty() || ext_ok(name, &q.exts))
-                        && q.name_re.as_ref().is_none_or(|re| re.is_match(name));
-                    if ok {
-                        h.flags |= NF_OK;
-                    }
-                    if ok || h.bits != 0 || h.flags & NF_NEG != 0 {
-                        out.push((k as u32, h));
+                    None => {
+                        for k in a..b {
+                            if let Some(h) = score_one(k, &mut ok) {
+                                put(k, h);
+                            }
+                        }
                     }
                 }
-                out
+                (n, ok)
             })
             .collect();
-        let mut t = NameTable { bits: vec![0u64; idx.u.div_ceil(64)], sparse: parts.concat(), dense: None };
-        for &(id, _) in &t.sparse {
-            t.bits[id as usize >> 6] |= 1 << (id & 63);
-        }
-        if t.sparse.len() > 1 << 16 {
-            let mut d = vec![NameHit { score: 0, bits: 0, flags: 0, best: [0; 4] }; idx.u];
-            for &(id, h) in &t.sparse {
-                d[id as usize] = h;
-            }
-            t.dense = Some(d);
+        let ok_entries = counts.iter().map(|c| c.1).sum();
+        let total: usize = counts.iter().map(|c| c.0).sum();
+        let mut t = NameTable { bits, sparse: Vec::new(), dense: Some(dense), ok_entries };
+        if total <= 1 << 16 {
+            // Few matches: keep a compact copy and give the big table back.
+            t.sparse = t.iter().collect();
+            DENSE_POOL.lock().unwrap().push(t.dense.take().unwrap());
         }
         t
     }
@@ -700,45 +734,222 @@ impl Searcher<'_> {
         out.clear();
         out.resize(idx.d, DirMemo::default());
         out.par_iter_mut().enumerate().with_min_len(1 << 12).for_each(|(k, slot)| {
-            if k == 0 {
-                return;
-            }
-            if let Some(h) = names.get(en[de[k] as usize]) {
-                *slot = if h.flags & NF_NEG != 0 { DirMemo { bits: u32::MAX, best: [0; 4] } } else { DirMemo { bits: h.bits as u32, best: h.best } };
+            if k > 0 {
+                *slot = DirMemo::own(names, en[de[k] as usize]);
             }
         });
+        // Fold ancestors in, parents first. A dir's descendants are one
+        // contiguous id range, so the children of huge dirs go one by one,
+        // then every small subtree in parallel.
         let dp = idx.dir_parent();
-        for k in 1..idx.d {
-            let p = out[dp[k] as usize];
-            let me = &mut out[k];
-            if p.bits == u32::MAX || me.bits == u32::MAX {
-                me.bits = u32::MAX;
-                continue;
+        let plan = idx.memo_plan();
+        for &k in &plan.upper {
+            out[k as usize] = out[k as usize].under(out[dp[k as usize] as usize]);
+        }
+        let roots: Vec<(u32, DirMemo)> = plan.chunks.iter().map(|(c, _)| (*c, out[*c as usize])).collect();
+        let mut slices = Vec::with_capacity(plan.chunks.len());
+        let mut rest: &mut [DirMemo] = &mut out;
+        let mut at = 0usize;
+        for (_, r) in &plan.chunks {
+            let (_, tail) = std::mem::take(&mut rest).split_at_mut(r.start as usize - at);
+            let (mine, tail) = tail.split_at_mut((r.end - r.start) as usize);
+            slices.push(mine);
+            rest = tail;
+            at = r.end as usize;
+        }
+        slices.into_par_iter().zip(&plan.chunks).zip(roots).for_each(|((slice, (_, r)), (c, root))| {
+            let a = r.start as usize;
+            for k in a..r.end as usize {
+                let p = dp[k];
+                let pm = if p == c { root } else { slice[p as usize - a] };
+                slice[k - a] = slice[k - a].under(pm);
             }
-            me.bits |= p.bits;
-            for t in 0..4 {
-                me.best[t] = me.best[t].max(p.best[t]);
+        });
+        out
+    }
+}
+
+/// Debug switch: always take the full pass (for checking the selective one).
+pub static FULL_PASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// One query's entry scoring, shared by the two strategies.
+struct Scan<'a> {
+    q: &'a Query,
+    live: &'a Live,
+    names: &'a NameTable,
+    npos: usize,
+    need_dirs: bool,
+    now: u32,
+}
+
+impl Scan<'_> {
+    /// Score entry `i` whose name scored `nh`, given its parent's memo.
+    /// `None` if it fails a filter or cannot beat `floor`.
+    #[inline(always)]
+    fn score(&self, i: usize, nh: NameHit, memo: DirMemo, floor: u64, pbuf: &mut Vec<u8>) -> Option<u64> {
+        let idx = &self.live.base;
+        let q = self.q;
+        let k = idx.kind()[i];
+        if q.kind.is_some_and(|want| k & 3 != want) {
+            return None;
+        }
+        if q.size != (0, u64::MAX) {
+            let sz = crate::index::dec_size(idx.size_raw()[i]);
+            if sz < q.size.0 || sz > q.size.1 {
+                return None;
             }
         }
-        out
+        let mtime = idx.mtime()[i];
+        if q.mtime != (0, u32::MAX) && (mtime < q.mtime.0 || mtime > q.mtime.1) {
+            return None;
+        }
+        let mut score = nh.score as i32;
+        if self.need_dirs {
+            let all = (1u32 << self.npos) - 1;
+            if memo.bits == u32::MAX || (nh.bits as u32 | memo.bits) & all != all {
+                return None;
+            }
+            for t in 0..self.npos {
+                if nh.bits & (1 << t) == 0 {
+                    // Matched by a folder on the path instead.
+                    score += memo.best.get(t).map_or(6, |&b| b as i32 * 3 / 4);
+                }
+            }
+        }
+        if self.live.is_dead(i as u32) {
+            return None;
+        }
+        let p = idx.parent()[i] as usize;
+        score += idx.dir_prior()[p] as i32 + rank_tweaks(nh.flags, k, mtime, self.now);
+        let key = key(score, i as u32);
+        if key <= floor {
+            return None;
+        }
+        if let Some(re) = &q.path_re {
+            idx.path(i, pbuf);
+            if !re.is_match(pbuf) {
+                return None;
+            }
+        }
+        Some(key)
+    }
+
+    /// One sequential pass over every entry in `lo..hi`.
+    fn full(&self, lo: usize, hi: usize, memo: Option<&[DirMemo]>) -> Vec<Hit> {
+        let idx = &self.live.base;
+        let (ent_name, parent) = (idx.ent_name(), idx.parent());
+        top_k(hi - lo, self.q.limit, |r, top| {
+            let mut pbuf = Vec::new();
+            for i in lo + r.start..lo + r.end {
+                let Some(nh) = self.names.get(ent_name[i]).filter(|h| h.flags & NF_OK != 0) else { continue };
+                let m = memo.map_or(DirMemo::default(), |m| m[parent[i] as usize]);
+                if let Some(k) = self.score(i, nh, m, top.floor(), &mut pbuf) {
+                    top.push(k);
+                }
+            }
+        })
+    }
+
+    /// Visit only the entries carrying a matching name; folder tokens are
+    /// checked by walking each candidate's ancestors (memoized per piece).
+    fn selective(&self, lo: usize, hi: usize) -> Vec<Hit> {
+        let idx = &self.live.base;
+        let (ne_off, ne, parent) = (idx.name_ents_off(), idx.name_ents(), idx.parent());
+        let ok: Vec<(u32, NameHit)> = self.names.iter().filter(|(_, h)| h.flags & NF_OK != 0).collect();
+        top_k(ok.len(), self.q.limit, |r, top| {
+            let (mut pbuf, mut memo) = (Vec::new(), HashMap::<u32, DirMemo, crate::index::Fx>::default());
+            for &(id, nh) in &ok[r] {
+                for &e in &ne[ne_off[id as usize] as usize..ne_off[id as usize + 1] as usize] {
+                    let i = e as usize;
+                    if i < lo || i >= hi {
+                        continue;
+                    }
+                    let m = if self.need_dirs { self.memo_of(parent[i], &mut memo) } else { DirMemo::default() };
+                    if let Some(k) = self.score(i, nh, m, top.floor(), &mut pbuf) {
+                        top.push(k);
+                    }
+                }
+            }
+        })
+    }
+
+    /// The dir memo of `d` (see `dir_tokens`), from its ancestor chain.
+    fn memo_of(&self, d: u32, cache: &mut HashMap<u32, DirMemo, crate::index::Fx>) -> DirMemo {
+        let idx = &self.live.base;
+        let (de, en, dp) = (idx.dir_entry(), idx.ent_name(), idx.dir_parent());
+        let mut chain = Vec::new();
+        let mut k = d;
+        let mut acc = loop {
+            if k == 0 {
+                break DirMemo::default();
+            }
+            if let Some(&m) = cache.get(&k) {
+                break m;
+            }
+            chain.push(k);
+            k = dp[k as usize];
+        };
+        for &k in chain.iter().rev() {
+            acc = DirMemo::own(self.names, en[de[k as usize] as usize]).under(acc);
+            cache.insert(k, acc);
+        }
+        acc
     }
 }
 
 /// The dir memo is ~13 MB; reusing it saves a page-fault storm per query.
 static MEMO_POOL: std::sync::Mutex<Vec<Vec<DirMemo>>> = std::sync::Mutex::new(Vec::new());
 
-struct Pooled(Option<Vec<DirMemo>>);
+/// What the name table depends on: two queries with the same key score
+/// every name the same.
+#[derive(PartialEq)]
+struct NameKey {
+    tokens: Vec<(Vec<u8>, Mode, bool)>,
+    exts: Vec<Vec<u8>>,
+    name_re: Option<String>,
+}
 
-impl std::ops::Deref for Pooled {
-    type Target = Vec<DirMemo>;
-    fn deref(&self) -> &Vec<DirMemo> {
-        self.0.as_ref().unwrap()
+impl NameKey {
+    fn of(q: &Query) -> NameKey {
+        NameKey {
+            tokens: q.tokens.iter().map(|t| (t.text.clone(), t.mode, t.negate)).collect(),
+            exts: q.exts.clone(),
+            name_re: q.name_re.as_ref().map(|r| r.as_str().to_string()),
+        }
+    }
+
+    /// Can only match names `prev` matched: same filters, same tokens, each
+    /// positive token the same or longer in a way that only narrows it.
+    fn narrows(&self, prev: &NameKey) -> bool {
+        self.exts == prev.exts
+            && self.name_re == prev.name_re
+            && self.tokens.len() == prev.tokens.len()
+            && self.tokens.iter().any(|t| !t.2)
+            && self.tokens.iter().zip(&prev.tokens).all(|(a, b)| {
+                a.1 == b.1
+                    && a.2 == b.2
+                    && if a.2 {
+                        a.0 == b.0
+                    } else if a.1 == Mode::Suffix {
+                        a.0.ends_with(&b.0)
+                    } else {
+                        a.0.starts_with(&b.0)
+                    }
+            })
     }
 }
 
-impl Drop for Pooled {
+/// The last query's name table (and dir memo, built on first use).
+pub struct Scored {
+    at: std::time::Instant,
+    key: NameKey,
+    names: NameTable,
+    memo: std::sync::OnceLock<Vec<DirMemo>>,
+}
+
+impl Drop for Scored {
     fn drop(&mut self) {
-        if let Some(v) = self.0.take().filter(|v| !v.is_empty()) {
+        if let Some(v) = self.memo.take() {
             let mut pool = MEMO_POOL.lock().unwrap();
             if pool.is_empty() {
                 pool.push(v);
@@ -747,16 +958,81 @@ impl Drop for Pooled {
     }
 }
 
+/// Lives with the index it was scored against (`Live`).
+#[derive(Default)]
+pub struct NameCache(std::sync::Mutex<Option<std::sync::Arc<Scored>>>);
+
+impl NameCache {
+    /// Drop the cached table and spare buffers once searching has stopped:
+    /// tens of MB after a broad query, worth keeping only while typing.
+    pub fn trim_if_idle(&self, idle: std::time::Duration) {
+        let mut g = self.0.lock().unwrap();
+        if g.as_ref().is_some_and(|s| s.at.elapsed() > idle) {
+            *g = None;
+            drop(g);
+            trim_pools();
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
-struct DirMemo {
+pub struct DirMemo {
     bits: u32,
     best: [i16; 4],
+}
+
+impl DirMemo {
+    /// A dir's own name's contribution.
+    #[inline]
+    fn own(names: &NameTable, name: u32) -> DirMemo {
+        match names.get(name) {
+            Some(h) if h.flags & NF_NEG != 0 => DirMemo { bits: u32::MAX, best: [0; 4] },
+            Some(h) => DirMemo { bits: h.bits as u32, best: h.best },
+            None => DirMemo::default(),
+        }
+    }
+
+    /// This dir's memo with its parent's folded in.
+    #[inline]
+    fn under(self, p: DirMemo) -> DirMemo {
+        if p.bits == u32::MAX || self.bits == u32::MAX {
+            return DirMemo { bits: u32::MAX, best: self.best };
+        }
+        let mut best = self.best;
+        for t in 0..4 {
+            best[t] = best[t].max(p.best[t]);
+        }
+        DirMemo { bits: self.bits | p.bits, best }
+    }
+}
+
+/// Spare dense name tables (24 MB each on this disk), so a broad query
+/// doesn't page-fault a fresh one in.
+static DENSE_POOL: std::sync::Mutex<Vec<Vec<NameHit>>> = std::sync::Mutex::new(Vec::new());
+
+/// Free the spare buffers searches keep for speed (after a quiet spell).
+pub fn trim_pools() {
+    DENSE_POOL.lock().unwrap().clear();
+    MEMO_POOL.lock().unwrap().clear();
+}
+
+impl Drop for NameTable {
+    fn drop(&mut self) {
+        if let Some(d) = self.dense.take() {
+            let mut pool = DENSE_POOL.lock().unwrap();
+            if pool.len() < 2 {
+                pool.push(d);
+            }
+        }
+    }
 }
 
 struct NameTable {
     bits: Vec<u64>,
     sparse: Vec<(u32, NameHit)>,
     dense: Option<Vec<NameHit>>,
+    /// Entries carrying a name that passes as a match (NF_OK).
+    ok_entries: usize,
 }
 
 impl NameTable {
@@ -770,6 +1046,23 @@ impl NameTable {
             None => self.sparse.binary_search_by_key(&id, |e| e.0).ok().map(|k| self.sparse[k].1),
         }
     }
+
+    /// Every name in the table, ascending.
+    fn iter(&self) -> Box<dyn Iterator<Item = (u32, NameHit)> + '_> {
+        match &self.dense {
+            None => Box::new(self.sparse.iter().copied()),
+            Some(d) => Box::new(self.bits.iter().enumerate().flat_map(move |(w, &b)| {
+                let mut b = b;
+                std::iter::from_fn(move || {
+                    (b != 0).then(|| {
+                        let id = w as u32 * 64 + b.trailing_zeros();
+                        b &= b - 1;
+                        (id, d[id as usize])
+                    })
+                })
+            })),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -780,6 +1073,10 @@ struct NameHit {
     flags: u8,
     /// Per-token score, first 4 tokens (for the folder memo).
     best: [i16; 4],
+}
+
+impl NameHit {
+    const NONE: NameHit = NameHit { score: 0, bits: 0, flags: 0, best: [0; 4] };
 }
 
 const NF_OK: u8 = 1;

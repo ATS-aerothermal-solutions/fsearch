@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"FSIDX005";
+const MAGIC: &[u8; 8] = b"FSIDX006";
 const HDR: usize = 4096;
 
 #[derive(Clone, Copy)]
@@ -36,8 +36,10 @@ enum Sec {
     DirEnd,
     DirPrior,
     DirParent,
+    NameEntsOff,
+    NameEnts,
 }
-const NSEC: usize = 14;
+const NSEC: usize = 16;
 
 pub struct Index {
     map: Mmap,
@@ -50,6 +52,16 @@ pub struct Index {
     /// FSEvents id the index is current as of; replay starts here.
     pub event_id: u64,
     off: [usize; NSEC],
+    plan: std::sync::OnceLock<MemoPlan>,
+}
+
+/// How to fold per-dir data down the tree in parallel (see `memo_plan`).
+pub struct MemoPlan {
+    /// Dirs to do one by one, parents first.
+    pub upper: Vec<u32>,
+    /// (dir, its descendants' id range): the range's parents are the dir or
+    /// inside the range, so each runs on its own once `upper` is done.
+    pub chunks: Vec<(u32, std::ops::Range<u32>)>,
 }
 
 macro_rules! sec {
@@ -80,6 +92,10 @@ impl Index {
     sec!(dir_end, Sec::DirEnd, u32, d);
     sec!(dir_prior, Sec::DirPrior, i8, d);
     sec!(dir_parent, Sec::DirParent, u32, d);
+    // Per distinct name, the entries carrying it (ascending): a selective
+    // query visits only these instead of every entry on disk.
+    sec!(name_ents_off, Sec::NameEntsOff, u32, u1);
+    sec!(name_ents, Sec::NameEnts, u32, n);
 
     pub fn uname(&self, id: u32) -> &[u8] {
         let o = self.name_off();
@@ -101,6 +117,37 @@ impl Index {
     pub fn children(&self, d: u32) -> std::ops::Range<usize> {
         let s = self.dir_start()[d as usize] as usize;
         s..s + self.dir_len()[d as usize] as usize
+    }
+
+    /// Dir ids of `k`'s strict descendants: one contiguous range, since dir
+    /// ids follow entry order and a subtree's entries are contiguous.
+    pub fn descendants(&self, k: u32) -> std::ops::Range<u32> {
+        let de = self.dir_entry();
+        let (s, e) = (self.dir_start()[k as usize], self.dir_end()[k as usize]);
+        de.partition_point(|&x| x < s) as u32..de.partition_point(|&x| x < e) as u32
+    }
+
+    /// Split the dir tree for parallel top-down folding: subtrees of at most
+    /// ~4k dirs become chunks; the children of bigger dirs go in `upper`.
+    pub fn memo_plan(&self) -> &MemoPlan {
+        self.plan.get_or_init(|| {
+            const CHUNK: u32 = 4096;
+            let de = self.dir_entry();
+            let mut p = MemoPlan { upper: Vec::new(), chunks: Vec::new() };
+            let mut big = vec![0u32];
+            while let Some(k) = big.pop() {
+                // k's child dirs: the dirs whose entry is in k's children block.
+                let (s, l) = (self.dir_start()[k as usize], self.dir_len()[k as usize]);
+                let kids = de.partition_point(|&x| x < s) as u32..de.partition_point(|&x| x < s + l) as u32;
+                for c in kids {
+                    p.upper.push(c);
+                    let r = self.descendants(c);
+                    if r.end - r.start > CHUNK { big.push(c) } else if r.start < r.end { p.chunks.push((c, r)) }
+                }
+            }
+            p.chunks.sort_by_key(|c| c.1.start);
+            p
+        })
     }
 
     pub fn path(&self, i: usize, out: &mut Vec<u8>) {
@@ -225,6 +272,21 @@ impl Index {
         let mut umask = vec![0u64; u];
         umask.par_iter_mut().enumerate().for_each(|(k, m)| *m = char_mask(&unames[uoff[k] as usize..uoff[k + 1] as usize]));
         let enc: Vec<u32> = size[..n].iter().map(|&s| enc_size(s)).collect();
+        // Entries grouped by name (counting sort keeps them ascending).
+        let mut ne_off = vec![0u32; u + 1];
+        for &id in &ent_name {
+            ne_off[id as usize + 1] += 1;
+        }
+        for k in 0..u {
+            ne_off[k + 1] += ne_off[k];
+        }
+        let mut fill = ne_off[..u].to_vec();
+        let mut ne = vec![0u32; n];
+        for (i, &id) in ent_name.iter().enumerate() {
+            ne[fill[id as usize] as usize] = i as u32;
+            fill[id as usize] += 1;
+        }
+        drop(fill);
 
         // Subtree end: own block end, folded upward (children have larger ids).
         let dir_entry: Vec<u32> = blocks.iter().map(|b| b.0).collect();
@@ -276,6 +338,8 @@ impl Index {
         put(base, off[Sec::DirEnd as usize], &end);
         put(base, off[Sec::DirPrior as usize], &prior);
         put(base, off[Sec::DirParent as usize], &dir_entry.iter().map(|&e| parent[e as usize]).collect::<Vec<_>>());
+        put(base, off[Sec::NameEntsOff as usize], &ne_off);
+        put(base, off[Sec::NameEnts as usize], &ne);
         put(base, 0, &header(n, d, u, unames.len(), event_id));
         Index::from_map(m.make_read_only().unwrap()).unwrap()
     }
@@ -290,7 +354,7 @@ impl Index {
         if map.len() < total {
             return None;
         }
-        Some(Index { n, d, u, u1: u + 1, names_len, event_id: h(4) as u64, off, map })
+        Some(Index { n, d, u, u1: u + 1, names_len, event_id: h(4) as u64, off, map, plan: std::sync::OnceLock::new() })
     }
 
     /// Write atomically (tmp + rename), stamping the current event id.
@@ -345,7 +409,7 @@ fn header(n: usize, d: usize, u: usize, names_len: usize, event_id: u64) -> Vec<
 }
 
 fn section_lens(n: usize, d: usize, u: usize, names_len: usize) -> [usize; NSEC] {
-    [u * 8, (u + 1) * 4, names_len, n * 4, n, n * 4, n * 4, n * 4, d * 4, d * 4, d * 4, d * 4, d, d * 4]
+    [u * 8, (u + 1) * 4, names_len, n * 4, n, n * 4, n * 4, n * 4, d * 4, d * 4, d * 4, d * 4, d, d * 4, (u + 1) * 4, n * 4]
 }
 
 /// Sizes in 4 bytes: exact below 2 GiB, 2 MiB granularity above.
