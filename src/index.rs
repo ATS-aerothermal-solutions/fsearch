@@ -146,7 +146,11 @@ impl Index {
                 for c in kids {
                     p.upper.push(c);
                     let r = self.descendants(c);
-                    if r.end - r.start > CHUNK { big.push(c) } else if r.start < r.end { p.chunks.push((c, r)) }
+                    if r.end - r.start > CHUNK {
+                        big.push(c)
+                    } else if r.start < r.end {
+                        p.chunks.push((c, r))
+                    }
                 }
             }
             p.chunks.sort_by_key(|c| c.1.start);
@@ -479,6 +483,7 @@ pub fn char_bit(b: u8) -> u64 {
     }
 }
 
+#[rustfmt::skip]
 const BUNDLE_EXTS: &[&[u8]] = &[
     b".framework", b".bundle", b".plugin", b".appex", b".kext", b".xpc", b".lproj", b".xcassets", b".photoslibrary",
     b".musiclibrary", b".tvlibrary", b".imovielibrary", b".dSYM", b".xcarchive", b".sdk", b".platform",

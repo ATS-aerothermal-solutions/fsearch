@@ -35,6 +35,7 @@ const BITSET: u32 = 1 << 31;
 const HDR: usize = 4096;
 
 /// Directory names whose subtrees are generated, vendored, or caches.
+#[rustfmt::skip]
 const SKIP_DIRS: &[&[u8]] = &[
     b"node_modules", b".git", b"target", b"DerivedData", b"__pycache__", b".venv", b"venv", b"site-packages", b"Pods",
     b".next", b".turbo", b".cache", b"Library", b"dist", b"build", b".build", b".rustup", b".cargo", b".npm", b".bun",
@@ -45,16 +46,19 @@ const SKIP_DIRS: &[&[u8]] = &[
 ];
 
 /// Home-relative trees that are dependencies or app data, not your files.
+#[rustfmt::skip]
 const SKIP_UNDER_HOME: &[&[u8]] = &[
     b"go/pkg", b".cursor/extensions", b".vscode/extensions", b".local/share", b".local/state", b".config/gcloud", b".codex/.tmp",
 ];
 
 /// Package/library bundles: their insides are app data.
+#[rustfmt::skip]
 const SKIP_SUFFIXES: &[&[u8]] = &[
     b".app", b".photoslibrary", b".library", b".lrlibrary", b".musiclibrary", b".tvlibrary", b".imovielibrary",
     b".xcassets", b".framework", b".bundle", b".xcarchive", b".xcresult", b".dSYM", b".salon", b".lrdata",
 ];
 
+#[rustfmt::skip]
 const TEXT_EXTS: &[&[u8]] = &[
     b"rs", b"c", b"h", b"cc", b"cpp", b"cxx", b"hpp", b"hh", b"m", b"mm", b"swift", b"go", b"py", b"pyi", b"js", b"mjs", b"cjs",
     b"ts", b"mts", b"cts", b"tsx", b"jsx", b"java", b"kt", b"kts", b"scala", b"rb", b"php", b"cs", b"fs", b"sh", b"zsh", b"bash",
@@ -498,18 +502,20 @@ fn merge_segments(dir: &Path, id: u64, segs: &[&Segment]) -> Option<Segment> {
     }
     let mut pos = vec![0usize; segs.len()];
     let mut part = Vec::new();
-    write_segment(dir, id, &meta, |list| loop {
-        let t = segs.iter().zip(&pos).filter_map(|(s, &p)| s.tri_key().get(p).copied()).min()?;
-        for (si, s) in segs.iter().enumerate() {
-            if s.tri_key().get(pos[si]) == Some(&t) {
-                part.clear();
-                s.list_into(pos[si], &mut part);
-                list.extend(part.iter().map(|&d| remap[si][d as usize]).filter(|&d| d != u32::MAX));
-                pos[si] += 1;
+    write_segment(dir, id, &meta, |list| {
+        loop {
+            let t = segs.iter().zip(&pos).filter_map(|(s, &p)| s.tri_key().get(p).copied()).min()?;
+            for (si, s) in segs.iter().enumerate() {
+                if s.tri_key().get(pos[si]) == Some(&t) {
+                    part.clear();
+                    s.list_into(pos[si], &mut part);
+                    list.extend(part.iter().map(|&d| remap[si][d as usize]).filter(|&d| d != u32::MAX));
+                    pos[si] += 1;
+                }
             }
-        }
-        if !list.is_empty() {
-            return Some(t);
+            if !list.is_empty() {
+                return Some(t);
+            }
         }
     })
 }
@@ -566,9 +572,8 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
     fn bytes<T: Copy>(v: &[T]) -> &[u8] {
         unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     }
-    let sections: [&[u8]; NS] = [
-        bytes(&keys), bytes(&tri_off), &post, bytes(&path_off), &paths, bytes(&size), bytes(&mtime), bytes(&by_path), bytes(&rank),
-    ];
+    let sections: [&[u8]; NS] =
+        [bytes(&keys), bytes(&tri_off), &post, bytes(&path_off), &paths, bytes(&size), bytes(&mtime), bytes(&by_path), bytes(&rank)];
     let p = seg_path(dir, id);
     let tmp = p.with_extension("tmp");
     let write = || -> std::io::Result<()> {
@@ -644,11 +649,8 @@ impl Content {
     /// Open the segments the manifest lists, without touching anything: the
     /// view of an engine that follows another process's index.
     pub fn open_shared(dir: PathBuf) -> Content {
-        let manifest: Vec<u64> = std::fs::read_to_string(dir.join("manifest"))
-            .unwrap_or_default()
-            .split_whitespace()
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        let manifest: Vec<u64> =
+            std::fs::read_to_string(dir.join("manifest")).unwrap_or_default().split_whitespace().filter_map(|s| s.parse().ok()).collect();
         let segs: Vec<Segment> = manifest.iter().filter_map(|&id| Segment::load(&dir, id)).collect();
         let next_id = segs.iter().map(|s| s.id + 1).max().unwrap_or(1);
         Content { dir, segs, next_id }
@@ -839,11 +841,7 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
     let idx = &live.base;
     let mut p = Vec::new();
     if let Some(d) = idx.lookup(dir).filter(|&e| !live.is_dead(e)).and_then(|e| idx.dir_of(e)) {
-        let range = if recursive {
-            idx.dir_start()[d as usize] as usize..idx.dir_end()[d as usize] as usize
-        } else {
-            idx.children(d)
-        };
+        let range = if recursive { idx.dir_start()[d as usize] as usize..idx.dir_end()[d as usize] as usize } else { idx.children(d) };
         for i in range {
             if idx.kind()[i] & 3 != KIND_FILE || live.is_dead(i as u32) || idx.size_of(i) > MAX_FILE {
                 continue;
@@ -951,7 +949,12 @@ fn read_pool() -> &'static rayon::ThreadPool {
         rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .thread_name(|i| format!("fsearch-read-{i}"))
-            .start_handler(|_| crate::no_materialize())
+            .start_handler(|_| {
+                // Someone is waiting on these reads: keep them off the slow
+                // cores and out of the throttled IO tiers.
+                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
+                crate::no_materialize()
+            })
             .build()
             .unwrap()
     })

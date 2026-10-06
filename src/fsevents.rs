@@ -60,11 +60,8 @@ unsafe extern "C" {
 extern "C" fn on_events(_s: *mut c_void, info: *mut c_void, n: usize, paths: *mut c_void, flags: *const u32, ids: *const u64) {
     let tx = unsafe { &*(info as *const Sender<Vec<Event>>) };
     let paths = paths as *const *const i8;
-    let batch = (0..n)
-        .map(|i| unsafe {
-            Event { path: CStr::from_ptr(*paths.add(i)).to_bytes().to_vec(), flags: *flags.add(i), id: *ids.add(i) }
-        })
-        .collect();
+    let batch =
+        (0..n).map(|i| unsafe { Event { path: CStr::from_ptr(*paths.add(i)).to_bytes().to_vec(), flags: *flags.add(i), id: *ids.add(i) } }).collect();
     let _ = tx.send(batch);
 }
 

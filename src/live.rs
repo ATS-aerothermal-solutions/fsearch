@@ -70,7 +70,17 @@ impl Live {
         let words = base.n.div_ceil(64);
         let event_id = base.event_id;
         let synced_at = base.synced_at;
-        Live { base, dead: vec![0; words], dead_count: 0, over: BTreeMap::new(), event_id, trees: Vec::new(), names_cache: Default::default(), synced_at, priors: HashMap::new() }
+        Live {
+            base,
+            dead: vec![0; words],
+            dead_count: 0,
+            over: BTreeMap::new(),
+            event_id,
+            trees: Vec::new(),
+            names_cache: Default::default(),
+            synced_at,
+            priors: HashMap::new(),
+        }
     }
 
     /// Put an entry in the overlay, stamping the prior it ranks with.
@@ -254,9 +264,7 @@ impl Live {
                         self.kill_subtree(c as u32);
                         let scan = f.scans.remove(&child);
                         self.add_new(child, now, scan);
-                    } else if now.kind & 3 != KIND_DIR
-                        && (self.base.size_raw()[c] != enc_size(now.size) || self.base.mtime()[c] != now.mtime)
-                    {
+                    } else if now.kind & 3 != KIND_DIR && (self.base.size_raw()[c] != enc_size(now.size) || self.base.mtime()[c] != now.mtime) {
                         self.kill(c as u32);
                         self.put(child, now);
                     }

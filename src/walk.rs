@@ -73,11 +73,7 @@ thread_local! {
 /// Scan `root` recursively. Listing id 0 is `root` itself.
 pub fn scan(root: &[u8], threads: usize) -> (Vec<Listing>, Stats) {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).start_handler(|_| crate::no_materialize()).build().unwrap();
-    let ctx = Ctx {
-        next_id: AtomicU32::new(1),
-        out: (0..threads + 1).map(|_| Mutex::new(Vec::new())).collect(),
-        stats: Stats::default(),
-    };
+    let ctx = Ctx { next_id: AtomicU32::new(1), out: (0..threads + 1).map(|_| Mutex::new(Vec::new())).collect(), stats: Stats::default() };
     raise_fd_limit();
     let fd = if blocked(root) { -1 } else { CString::new(root).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) }) };
     // Paths are only tracked when there is something to skip.
@@ -183,26 +179,22 @@ fn list_into(path: &[u8], l: &mut Listing) -> bool {
 fn list_fd(fd: i32, l: &mut Listing) {
     let mut al: libc::attrlist = unsafe { std::mem::zeroed() };
     al.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
-    al.commonattr = libc::ATTR_CMN_RETURNED_ATTRS
-        | libc::ATTR_CMN_NAME
-        | ATTR_CMN_ERROR
-        | libc::ATTR_CMN_OBJTYPE
-        | libc::ATTR_CMN_MODTIME
-        | libc::ATTR_CMN_FLAGS;
+    al.commonattr =
+        libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | ATTR_CMN_ERROR | libc::ATTR_CMN_OBJTYPE | libc::ATTR_CMN_MODTIME | libc::ATTR_CMN_FLAGS;
     al.dirattr = libc::ATTR_DIR_MOUNTSTATUS;
     al.fileattr = libc::ATTR_FILE_DATALENGTH;
-    BUF.with_borrow_mut(|buf| loop {
-        let n = unsafe {
-            libc::getattrlistbulk(fd, &mut al as *mut _ as *mut libc::c_void, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
-        };
-        if n <= 0 {
-            break;
-        }
-        let mut p = 0usize;
-        for _ in 0..n {
-            let len = rd32(buf, p) as usize;
-            parse_entry(&buf[p..p + len], l);
-            p += len;
+    BUF.with_borrow_mut(|buf| {
+        loop {
+            let n = unsafe { libc::getattrlistbulk(fd, &mut al as *mut _ as *mut libc::c_void, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+            if n <= 0 {
+                break;
+            }
+            let mut p = 0usize;
+            for _ in 0..n {
+                let len = rd32(buf, p) as usize;
+                parse_entry(&buf[p..p + len], l);
+                p += len;
+            }
         }
     });
 }

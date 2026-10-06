@@ -165,7 +165,6 @@ fn bench(qs: &str) {
     eprintln!("first {:.2?}  median {:.2?}  min {:.2?}", times[0].max(times[times.len() - 1]), times[times.len() / 2], times[0]);
 }
 
-
 fn plist_path() -> PathBuf {
     PathBuf::from(home()).join(format!("Library/LaunchAgents/{LABEL}.plist"))
 }

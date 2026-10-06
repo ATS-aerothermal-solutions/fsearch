@@ -113,6 +113,21 @@ pub fn no_materialize() {
     unsafe { setiopolicy_np(3, 1, 1) };
 }
 
+/// Searches run here, at user-interactive QoS: an app's background executor
+/// (or any low-QoS caller) would otherwise put the scan on efficiency cores.
+fn search_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("fsearch-search-{i}"))
+            .start_handler(|_| unsafe {
+                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+            })
+            .build()
+            .unwrap()
+    })
+}
+
 fn spawn(name: &str, f: impl FnOnce() + Send + 'static) {
     std::thread::Builder::new()
         .name(name.into())
@@ -209,8 +224,8 @@ impl Engine {
         let g = self.s.live.read().unwrap();
         let Some(live) = g.as_ref() else { return Err(INDEXING.into()) };
         let mut p = Vec::new();
-        Ok(Searcher { live }
-            .search(q)
+        Ok(search_pool()
+            .install(|| Searcher { live }.search(q))
             .into_iter()
             .map(|h| {
                 let (kind, size, mtime) = match &h.over {
@@ -237,14 +252,14 @@ impl Engine {
         let home = self.s.home.as_bytes();
         let indexed = q.scope.as_ref().is_none_or(|s| content::in_scope(s, home));
         if indexed {
-            return Ok((self.s.content.read().unwrap().search(g, q), true));
+            return Ok((search_pool().install(|| self.s.content.read().unwrap().search(g, q)), true));
         }
         // Pick files under the lock, read them after releasing it: reading can
         // be slow and a waiting writer would stall every other query.
         let paths = {
             let l = self.s.live.read().unwrap();
             let Some(live) = l.as_ref() else { return Err(INDEXING.into()) };
-            content::scan_paths(live, q.clone_for_scan())
+            search_pool().install(|| content::scan_paths(live, q.clone_for_scan()))
         };
         Ok((content::verify_owned(g, paths, q.limit), false))
     }
@@ -296,7 +311,9 @@ impl Shared {
         let path = self.dir.join("index.bin");
         let saved = Index::saved_event_id(&path).unwrap_or(0);
         let ours = self.live.read().unwrap().as_ref().map_or(0, |l| l.base.event_id);
-        if saved > ours && let Some(base) = Index::load(&path) {
+        if saved > ours
+            && let Some(base) = Index::load(&path)
+        {
             log(format!("following the owner's save: {} entries, replaying since {}", base.n, base.event_id));
             self.watch(base.event_id);
             *self.live.write().unwrap() = Some(Live::new(base));
@@ -549,7 +566,10 @@ fn relist_changed(shared: &Shared, why: &str, flags: u32) {
     };
     let n = dirs.len();
     let _ = shared.content_tx.send((dirs, trees));
-    log(format!("FSEvents lost track of / ({why}, flags {flags:#x}): relisted {n} folders changed since {from} in {:.2?} ({stat_time:.2?} checking)", t.elapsed()));
+    log(format!(
+        "FSEvents lost track of / ({why}, flags {flags:#x}): relisted {n} folders changed since {from} in {:.2?} ({stat_time:.2?} checking)",
+        t.elapsed()
+    ));
 }
 
 fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {

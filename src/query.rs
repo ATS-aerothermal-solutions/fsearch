@@ -54,6 +54,7 @@ pub struct Hit {
     pub over: Option<Vec<u8>>,
 }
 
+#[rustfmt::skip]
 const TYPES: &[(&str, &[&str])] = &[
     ("image", &["png", "jpg", "jpeg", "gif", "heic", "heif", "webp", "tiff", "tif", "bmp", "svg", "raw", "cr2", "cr3", "nef", "arw", "dng", "psd", "ico", "icns", "avif", "jxl"]),
     ("video", &["mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv", "flv", "mpg", "mpeg", "3gp", "hevc"]),
@@ -492,8 +493,9 @@ fn token_score(name: &[u8], t: &Token) -> Option<i32> {
     match t.mode {
         Mode::Fuzzy => fuzzy_score(name, &t.text),
         Mode::Exact => find_ci(name, &t.text).map(|p| 40 + if p == 0 { 30 } else { 0 } - (name.len() as i32).min(80) / 3),
-        Mode::Prefix => (name.len() >= t.text.len() && name.iter().zip(&t.text).all(|(&a, &b)| fold(a) == b))
-            .then(|| 60 - (name.len() as i32).min(80) / 3),
+        Mode::Prefix => {
+            (name.len() >= t.text.len() && name.iter().zip(&t.text).all(|(&a, &b)| fold(a) == b)).then(|| 60 - (name.len() as i32).min(80) / 3)
+        }
         Mode::Suffix => (name.len() >= t.text.len() && name[name.len() - t.text.len()..].iter().zip(&t.text).all(|(&a, &b)| fold(a) == b))
             .then(|| 50 - (name.len() as i32).min(80) / 3),
     }
@@ -641,7 +643,12 @@ impl Searcher<'_> {
             }
         }
         let from = prev.as_ref().filter(|p| key.narrows(&p.key)).map(|p| &p.names);
-        let scored = std::sync::Arc::new(Scored { at: std::time::Instant::now(), key, names: self.score_names(q, pos, neg, from), memo: std::sync::OnceLock::new() });
+        let scored = std::sync::Arc::new(Scored {
+            at: std::time::Instant::now(),
+            key,
+            names: self.score_names(q, pos, neg, from),
+            memo: std::sync::OnceLock::new(),
+        });
         *self.live.names_cache.0.lock().unwrap() = Some(scored.clone());
         scored
     }
