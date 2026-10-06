@@ -15,6 +15,17 @@ pub struct OEnt {
     pub kind: u8,
     pub size: u64,
     pub mtime: u32,
+    /// Char mask of the entry's name, so a search rejects most of the
+    /// overlay with one AND.
+    pub mask: u64,
+}
+
+impl OEnt {
+    /// `path` may be the whole path or just the name.
+    pub fn new(path: &[u8], kind: u8, size: u64, mtime: u32) -> OEnt {
+        let name = &path[path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1)..];
+        OEnt { kind, size, mtime, mask: crate::index::char_mask(name) }
+    }
 }
 
 pub struct Live {
@@ -132,7 +143,7 @@ impl Live {
         for r in &listing.ents {
             let name = &listing.names[r.name_off as usize..][..r.name_len as usize];
             let child = join(&p, name);
-            let now = OEnt { kind: r.kind, size: r.size, mtime: r.mtime };
+            let now = OEnt::new(name, r.kind, r.size, r.mtime);
             match cur.remove(name) {
                 None => self.add_new(child, now),
                 Some(Some(c)) => {
@@ -189,7 +200,8 @@ impl Live {
         self.trees.push(path.clone());
         let (ls, _) = walk::scan(&path, 4);
         for_each_path(&ls, &path, |p, r| {
-            self.over.insert(p, OEnt { kind: r.kind, size: r.size, mtime: r.mtime });
+            let e = OEnt::new(&p, r.kind, r.size, r.mtime);
+            self.over.insert(p, e);
         });
     }
 
@@ -304,5 +316,5 @@ fn lstat(path: &[u8]) -> Option<OEnt> {
         libc::S_IFLNK => walk::KIND_LINK,
         _ => walk::KIND_OTHER,
     };
-    Some(OEnt { kind, size: st.st_size as u64, mtime: st.st_mtime.clamp(0, u32::MAX as i64) as u32 })
+    Some(OEnt::new(path, kind, st.st_size as u64, st.st_mtime.clamp(0, u32::MAX as i64) as u32))
 }

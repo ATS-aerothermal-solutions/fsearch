@@ -699,29 +699,48 @@ impl Searcher<'_> {
         t
     }
 
-    /// The overlay is small (entries added since the last compaction), so a
-    /// straight scan with path components standing in for the dir memo.
+    /// The overlay (entries added since the last compaction) has no dir
+    /// memo: each candidate's path components stand in for it. Its top
+    /// `limit` is all the merge can use.
     fn search_overlay(&self, q: &Query) -> Vec<Hit> {
         let idx = &self.live.base;
         let now = now_secs();
-        let mut out = Vec::new();
-        for (path, o) in &self.live.over {
-            let Some(mut score) = q.match_path(path, o.kind, o.size, o.mtime) else { continue };
-            let cut = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
-            // Prior of the nearest ancestor the base knows about.
-            let mut prior = 0;
-            let mut up = &path[..cut];
-            while !up.is_empty() {
-                if let Some(d) = idx.lookup(up).and_then(|e| idx.dir_of(e)) {
-                    prior = idx.dir_prior()[d as usize] as i32;
-                    break;
-                }
-                up = &up[..up.iter().rposition(|&b| b == b'/').unwrap_or(0)];
-            }
-            score += prior + rank_tweaks(name_flags(&path[cut + 1..]), o.kind, o.mtime, now);
-            out.push(Hit { score, idx: u32::MAX, over: Some(path.clone()) });
+        let masks: Vec<u64> = q.tokens.iter().filter(|t| !t.negate).map(|t| t.mask).collect();
+        // A hit needs some positive token in its own name.
+        let cands: Vec<(&Vec<u8>, &crate::live::OEnt)> =
+            self.live.over.iter().filter(|(_, o)| masks.is_empty() || masks.iter().any(|&m| o.mask & m == m)).collect();
+        let mut hits: Vec<Hit> = cands
+            .par_iter()
+            .fold(
+                || (Vec::new(), HashMap::<&[u8], i32, crate::index::Fx>::default()),
+                |(mut out, mut priors), &(path, o)| {
+                    if let Some(score) = q.match_path(path, o.kind, o.size, o.mtime) {
+                        let cut = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
+                        // Prior of the nearest ancestor the base knows about.
+                        let prior = *priors.entry(&path[..cut]).or_insert_with(|| {
+                            let mut up = &path[..cut];
+                            while !up.is_empty() {
+                                if let Some(d) = idx.lookup(up).and_then(|e| idx.dir_of(e)) {
+                                    return idx.dir_prior()[d as usize] as i32;
+                                }
+                                up = &up[..up.iter().rposition(|&b| b == b'/').unwrap_or(0)];
+                            }
+                            0
+                        });
+                        let score = score + prior + rank_tweaks(name_flags(&path[cut + 1..]), o.kind, o.mtime, now);
+                        out.push(Hit { score, idx: u32::MAX, over: Some(path.clone()) });
+                    }
+                    (out, priors)
+                },
+            )
+            .map(|(out, _)| out)
+            .flatten_iter()
+            .collect();
+        if hits.len() > q.limit {
+            hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.over.cmp(&b.over)));
+            hits.truncate(q.limit);
         }
-        out
+        hits
     }
 
     /// For each dir: which tokens its name or an ancestor's matches, with the
