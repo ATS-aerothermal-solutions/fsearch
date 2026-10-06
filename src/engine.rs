@@ -575,6 +575,7 @@ fn relist_changed(shared: &Shared, why: &str, flags: u32) {
 fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     let mut last_save = Instant::now();
     let mut last_follow = Instant::now();
+    let ours = shared.dir.as_os_str().as_bytes();
     loop {
         let mut events = match rx.recv_timeout(Duration::from_secs(60)) {
             Ok(b) => b,
@@ -584,6 +585,9 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         while let Ok(b) = rx.try_recv() {
             events.extend(b);
         }
+        // The owner wrote the index files: a follower picks that up now
+        // rather than at its next periodic check.
+        let owner_wrote = events.iter().any(|e| e.path.starts_with(ours));
         if !events.is_empty() {
             let mut dirs: HashMap<Vec<u8>, bool> = HashMap::new();
             let (mut max_id, mut root_flags) = (0, 0);
@@ -642,7 +646,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         if let Some(l) = shared.live.read().unwrap().as_ref() {
             l.names_cache.trim_if_idle(Duration::from_secs(60));
         }
-        if !shared.owner() && last_follow.elapsed() > FOLLOW_EVERY {
+        if !shared.owner() && (owner_wrote || last_follow.elapsed() > FOLLOW_EVERY) {
             last_follow = Instant::now();
             if !try_upgrade(shared) {
                 shared.follow();

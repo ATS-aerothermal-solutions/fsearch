@@ -7,7 +7,6 @@ pub const MUST_SCAN_SUBDIRS: u32 = 0x1;
 pub const USER_DROPPED: u32 = 0x2;
 pub const KERNEL_DROPPED: u32 = 0x4;
 pub const HISTORY_DONE: u32 = 0x10;
-const CREATE_FLAG_IGNORE_SELF: u32 = 0x8;
 const CREATE_FLAG_NO_DEFER: u32 = 0x2;
 
 pub struct Event {
@@ -97,7 +96,9 @@ pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
             release: std::ptr::null(),
             copy_description: std::ptr::null(),
         };
-        let s = FSEventStreamCreate(std::ptr::null(), on_events, &ctx, arr, since, latency, CREATE_FLAG_IGNORE_SELF | CREATE_FLAG_NO_DEFER);
+        // Not IgnoreSelf: linked into an app, the app's own renames and moves
+        // are exactly what its search must see.
+        let s = FSEventStreamCreate(std::ptr::null(), on_events, &ctx, arr, since, latency, CREATE_FLAG_NO_DEFER);
         let q = dispatch_queue_create(c"fsearch.fsevents".as_ptr(), std::ptr::null());
         FSEventStreamSetDispatchQueue(s, q);
         FSEventStreamStart(s);
