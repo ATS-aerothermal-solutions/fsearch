@@ -16,9 +16,11 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-const COMPACT_PENDING: usize = 200_000;
-// Saving rewrites ~250 MB; restart replays FSEvents history anyway, so
-// only persist twice a day (or when the overlay gets big).
+// Every search scans the whole overlay (~1 ms per 100k entries), and a
+// follower starting up replays everything since the save, so fold it into
+// the base once it grows: ~1 s of CPU and a ~280 MB write, about hourly on a
+// busy disk. Otherwise only twice a day; restart replays FSEvents anyway.
+const COMPACT_PENDING: usize = 50_000;
 const COMPACT_EVERY: Duration = Duration::from_secs(12 * 3600);
 const SCAN_THREADS: usize = 8;
 const CONTENT_QUIET: Duration = Duration::from_secs(2);
