@@ -133,27 +133,46 @@ fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
         .build()
         .unwrap();
     let home = shared.home.as_bytes().to_vec();
-    while let Ok((mut dirs, mut trees)) = rx.recv() {
-        // Debounce: wait for 2s of quiet (at most 30s), so files apps rewrite
-        // every second get indexed every half minute, not every 100 ms.
-        let first = Instant::now();
-        loop {
-            match rx.recv_timeout(CONTENT_QUIET) {
-                Ok((d, t)) => {
-                    dirs.extend(d);
-                    trees.extend(t);
-                    if first.elapsed() > CONTENT_MAX_WAIT {
-                        break;
+    // Per-folder debounce: a folder is processed 2s after its last change,
+    // or 30s after its first pending one if it never goes quiet. A file you
+    // save lands in ~2s; files apps rewrite every second cost one reindex
+    // per half minute.
+    let mut pending: HashMap<(Vec<u8>, bool), (Instant, Instant)> = HashMap::new();
+    loop {
+        let wait = if pending.is_empty() { Duration::from_secs(3600) } else { Duration::from_millis(250) };
+        match rx.recv_timeout(wait) {
+            Ok((d, t)) => {
+                let now = Instant::now();
+                for key in d.into_iter().map(|p| (p, false)).chain(t.into_iter().map(|p| (p, true))) {
+                    // Most of the disk's churn (Library, caches) is outside the indexed area.
+                    if content::in_scope(&key.0, &home) || (key.1 && home.starts_with(&key.0)) {
+                        pending.entry(key).and_modify(|e| e.1 = now).or_insert((now, now));
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(RecvTimeoutError::Disconnected) => return,
+                while let Ok((d, t)) = rx.try_recv() {
+                    for key in d.into_iter().map(|p| (p, false)).chain(t.into_iter().map(|p| (p, true))) {
+                        if content::in_scope(&key.0, &home) || (key.1 && home.starts_with(&key.0)) {
+                            pending.entry(key).and_modify(|e| e.1 = now).or_insert((now, now));
+                        }
+                    }
+                }
             }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
         }
-        dirs.sort();
-        dirs.dedup();
-        trees.sort();
-        trees.dedup();
+        let ripe: Vec<(Vec<u8>, bool)> = pending
+            .iter()
+            .filter(|(_, (first, last))| last.elapsed() >= CONTENT_QUIET || first.elapsed() >= CONTENT_MAX_WAIT)
+            .map(|(k, _)| k.clone())
+            .collect();
+        if ripe.is_empty() {
+            continue;
+        }
+        let (mut dirs, mut trees) = (Vec::<Vec<u8>>::new(), Vec::<Vec<u8>>::new());
+        for k in ripe {
+            pending.remove(&k);
+            if k.1 { trees.push(k.0) } else { dirs.push(k.0) }
+        }
         let t = Instant::now();
         let wants = {
             let g = shared.live.read().unwrap();
