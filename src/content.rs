@@ -40,12 +40,13 @@ const SKIP_DIRS: &[&[u8]] = &[
     b".next", b".turbo", b".cache", b"Library", b"dist", b"build", b".build", b".rustup", b".cargo", b".npm", b".bun",
     b".nvm", b"vendor", b".pnpm-store", b"coverage", b".Trash", b".svn", b".hg", b".gradle", b".m2", b".pyenv",
     b".rbenv", b".gem", b".conda", b"miniconda3", b"anaconda3", b".docker", b".orbstack", b".colima", b".lima",
-    b".ollama", b".android", b".expo", b".terraform.d", b".wrangler", b".vscode-server",
+    b".ollama", b".android", b".expo", b".terraform.d", b".wrangler", b".vscode-server", b"cache", b"Cache", b"caches",
+    b"Caches",
 ];
 
 /// Home-relative trees that are dependencies or app data, not your files.
 const SKIP_UNDER_HOME: &[&[u8]] = &[
-    b"go/pkg", b".cursor/extensions", b".vscode/extensions", b".local/share", b".config/gcloud", b".codex/.tmp",
+    b"go/pkg", b".cursor/extensions", b".vscode/extensions", b".local/share", b".local/state", b".config/gcloud", b".codex/.tmp",
 ];
 
 /// Package/library bundles: their insides are app data.

@@ -22,6 +22,8 @@ const COMPACT_PENDING: usize = 200_000;
 // only persist twice a day (or when the overlay gets big).
 const COMPACT_EVERY: Duration = Duration::from_secs(12 * 3600);
 const SCAN_THREADS: usize = 8;
+const CONTENT_QUIET: Duration = Duration::from_secs(2);
+const CONTENT_MAX_WAIT: Duration = Duration::from_secs(30);
 
 pub struct Shared {
     live: RwLock<Option<Live>>,
@@ -132,10 +134,26 @@ fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
         .unwrap();
     let home = shared.home.as_bytes().to_vec();
     while let Ok((mut dirs, mut trees)) = rx.recv() {
-        while let Ok((d, t)) = rx.try_recv() {
-            dirs.extend(d);
-            trees.extend(t);
+        // Debounce: wait for 2s of quiet (at most 30s), so files apps rewrite
+        // every second get indexed every half minute, not every 100 ms.
+        let first = Instant::now();
+        loop {
+            match rx.recv_timeout(CONTENT_QUIET) {
+                Ok((d, t)) => {
+                    dirs.extend(d);
+                    trees.extend(t);
+                    if first.elapsed() > CONTENT_MAX_WAIT {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
         }
+        dirs.sort();
+        dirs.dedup();
+        trees.sort();
+        trees.dedup();
         let t = Instant::now();
         let wants = {
             let g = shared.live.read().unwrap();

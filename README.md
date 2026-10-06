@@ -67,7 +67,8 @@ placeholders and never blocks on FIFOs.
   trigrams, tiered merging. A query becomes an AND/OR of trigrams (regexes are
   planned from their syntax tree), the postings pick candidates, and candidates
   are read fresh from disk and matched, so results are never stale.
-  Kept in sync by the same directory diffs as the name index.
+  Kept in sync by the same directory diffs as the name index, debounced
+  (2 s of quiet, at most 30 s) so files apps rewrite constantly cost little.
   `in:` outside the indexed area (e.g. `in:/etc`) greps the files the name
   index lists there instead of crawling.
 
