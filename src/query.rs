@@ -4,8 +4,7 @@ use crate::index::char_bit;
 use crate::live::Live;
 use crate::walk::{FLAG_HIDDEN, KIND_DIR, KIND_FILE, KIND_LINK};
 use rayon::prelude::*;
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
@@ -175,6 +174,12 @@ impl Query {
     /// Does a full path pass every filter and token? Returns the match score.
     /// Used where there is no dir memo: the overlay and content-search docs.
     pub fn match_path(&self, path: &[u8], kind: u8, size: u64, mtime: u32) -> Option<i32> {
+        self.match_path_with(path, kind, size, mtime, |dirs| self.dir_match(dirs))
+    }
+
+    /// `match_path`, with the folder half (`dir_match` of the path's folder
+    /// part) supplied by the caller, who can memoize it per folder.
+    pub fn match_path_with(&self, path: &[u8], kind: u8, size: u64, mtime: u32, dirs: impl FnOnce(&[u8]) -> DirMatch) -> Option<i32> {
         if let Some(s) = &self.scope {
             if !(path.starts_with(s) && path.get(s.len()) == Some(&b'/')) {
                 return None;
@@ -192,15 +197,18 @@ impl Query {
         {
             return None;
         }
-        // A hit needs some token in its own name; most overlay paths fail
-        // here, before the path is split into folders.
+        // A hit needs some token in its own name; most paths fail here,
+        // before the folders are looked at.
         let mut pos = self.tokens.iter().filter(|t| !t.negate).peekable();
         let m = crate::index::char_mask(name);
         if pos.peek().is_some() && !pos.any(|t| m & t.mask == t.mask && token_score(name, t).is_some()) {
             return None;
         }
-        let dirs: Vec<&[u8]> = path[..cut].split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
-        if self.tokens.iter().any(|t| t.negate && (token_matches(name, t) || dirs.iter().any(|d| token_matches(d, t)))) {
+        if self.tokens.iter().any(|t| t.negate && token_matches(name, t)) {
+            return None;
+        }
+        let d = dirs(&path[..cut]);
+        if d.negated {
             return None;
         }
         let pos: Vec<&Token> = self.tokens.iter().filter(|t| !t.negate).collect();
@@ -210,7 +218,7 @@ impl Query {
             if let Some(s) = token_score(name, tok) {
                 got |= 1 << t;
                 score += s;
-            } else if let Some(s) = dirs.iter().filter_map(|d| token_score(d, tok)).max() {
+            } else if let Some(s) = d.best[t] {
                 inherited |= 1 << t;
                 score += s * 3 / 4;
             }
@@ -223,6 +231,25 @@ impl Query {
         }
         Some(score)
     }
+
+    /// How the folders of a path (`/a/b` for `/a/b/name`) match the tokens:
+    /// the best score per positive token, and whether a negated one hits.
+    pub fn dir_match(&self, dirs: &[u8]) -> DirMatch {
+        let comps: Vec<&[u8]> = dirs.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+        let mut d = DirMatch { negated: false, best: [None; 8] };
+        d.negated = self.tokens.iter().any(|t| t.negate && comps.iter().any(|c| token_matches(c, t)));
+        for (t, tok) in self.tokens.iter().filter(|t| !t.negate).enumerate() {
+            d.best[t] = comps.iter().filter_map(|c| token_score(c, tok)).max();
+        }
+        d
+    }
+}
+
+/// See `Query::dir_match`.
+#[derive(Clone, Copy)]
+pub struct DirMatch {
+    negated: bool,
+    best: [Option<i32>; 8],
 }
 
 pub fn is_filter(k: &str) -> bool {
@@ -481,10 +508,13 @@ fn token_matches(name: &[u8], t: &Token) -> bool {
 }
 
 /// Top k by (score, then lower entry index): a total order, so the result
-/// does not depend on which thread saw which entry first.
+/// does not depend on which thread saw which entry first. Candidates above
+/// the floor collect in a buffer that is cut back to k now and then, which
+/// is cheaper than a heap when most of the disk matches.
 struct TopK {
     k: usize,
-    heap: BinaryHeap<Reverse<u64>>,
+    buf: Vec<u64>,
+    floor: u64,
 }
 
 #[inline(always)]
@@ -494,20 +524,28 @@ fn key(score: i32, i: u32) -> u64 {
 
 impl TopK {
     fn new(k: usize) -> TopK {
-        TopK { k, heap: BinaryHeap::with_capacity(k + 1) }
+        TopK { k, buf: Vec::new(), floor: if k == 0 { u64::MAX } else { 0 } }
     }
     /// Keys at or below this cannot get in.
     #[inline]
     fn floor(&self) -> u64 {
-        if self.heap.len() < self.k { 0 } else { self.heap.peek().map_or(u64::MAX, |r| r.0) }
+        self.floor
     }
     #[inline]
     fn push(&mut self, key: u64) {
-        if self.heap.len() < self.k {
-            self.heap.push(Reverse(key));
-        } else if key > self.floor() {
-            self.heap.pop();
-            self.heap.push(Reverse(key));
+        if key > self.floor {
+            self.buf.push(key);
+            if self.buf.len() >= (2 * self.k).max(64) {
+                self.cut();
+            }
+        }
+    }
+    /// Keep the k best; the k-th becomes the floor.
+    fn cut(&mut self) {
+        if self.buf.len() > self.k {
+            self.buf.select_nth_unstable_by(self.k - 1, |a, b| b.cmp(a));
+            self.buf.truncate(self.k);
+            self.floor = self.buf[self.k - 1];
         }
     }
 }
@@ -518,15 +556,18 @@ impl TopK {
 fn top_k(n: usize, k: usize, visit: impl Fn(std::ops::Range<usize>, &mut TopK) + Sync) -> Vec<Hit> {
     let pieces = (rayon::current_num_threads() * 4).min(n.max(1));
     let step = n.div_ceil(pieces).max(1);
-    let mut keys: Vec<u64> = (0..pieces)
+    let tops: Vec<TopK> = (0..pieces)
         .into_par_iter()
         .map(|p| {
             let mut top = TopK::new(k);
             visit((p * step).min(n)..((p + 1) * step).min(n), &mut top);
-            top.heap.into_iter().map(|Reverse(x)| x).collect::<Vec<_>>()
+            top.cut();
+            top
         })
-        .flatten_iter()
         .collect();
+    // A full piece's k-th best already bounds the overall k-th from below.
+    let floor = tops.iter().filter(|t| t.buf.len() == k).map(|t| t.floor()).max().unwrap_or(0);
+    let mut keys: Vec<u64> = tops.into_iter().flat_map(|t| t.buf).filter(|&x| x >= floor).collect();
     if keys.len() > k {
         if k == 0 {
             return Vec::new();
@@ -615,7 +656,10 @@ impl Searcher<'_> {
         let ne_off = idx.name_ents_off();
         let score_one = |k: usize, ok_entries: &mut usize| -> Option<NameHit> {
             let m = mask[k];
-            if !(pos.is_empty() || pos.iter().any(|t| m & t.mask == t.mask)) && neg.is_empty() {
+            // A name no token can match matters only when there are no positive
+            // tokens (then every name passes).
+            let fits = |t: &&Token| m & t.mask == t.mask;
+            if !pos.is_empty() && !pos.iter().any(fits) && !neg.iter().any(fits) {
                 return None;
             }
             let name = idx.uname(k as u32);
@@ -703,34 +747,25 @@ impl Searcher<'_> {
     /// memo: each candidate's path components stand in for it. Its top
     /// `limit` is all the merge can use.
     fn search_overlay(&self, q: &Query) -> Vec<Hit> {
-        let idx = &self.live.base;
         let now = now_secs();
         let masks: Vec<u64> = q.tokens.iter().filter(|t| !t.negate).map(|t| t.mask).collect();
         // A hit needs some positive token in its own name.
         let cands: Vec<(&Vec<u8>, &crate::live::OEnt)> =
             self.live.over.iter().filter(|(_, o)| masks.is_empty() || masks.iter().any(|&m| o.mask & m == m)).collect();
+        // Overlay entries cluster in a few busy folders: match each folder's
+        // components once per folder, not per entry.
         let mut hits: Vec<Hit> = cands
             .par_iter()
             .fold(
-                || (Vec::new(), HashMap::<&[u8], i32, crate::index::Fx>::default()),
-                |(mut out, mut priors), &(path, o)| {
-                    if let Some(score) = q.match_path(path, o.kind, o.size, o.mtime) {
-                        let cut = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
-                        // Prior of the nearest ancestor the base knows about.
-                        let prior = *priors.entry(&path[..cut]).or_insert_with(|| {
-                            let mut up = &path[..cut];
-                            while !up.is_empty() {
-                                if let Some(d) = idx.lookup(up).and_then(|e| idx.dir_of(e)) {
-                                    return idx.dir_prior()[d as usize] as i32;
-                                }
-                                up = &up[..up.iter().rposition(|&b| b == b'/').unwrap_or(0)];
-                            }
-                            0
-                        });
-                        let score = score + prior + rank_tweaks(name_flags(&path[cut + 1..]), o.kind, o.mtime, now);
+                || (Vec::new(), HashMap::<&[u8], DirMatch, crate::index::Fx>::default()),
+                |(mut out, mut memo), &(path, o)| {
+                    let cut = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
+                    let dir = &path[..cut];
+                    if let Some(score) = q.match_path_with(path, o.kind, o.size, o.mtime, |_| *memo.entry(dir).or_insert_with(|| q.dir_match(dir))) {
+                        let score = score + o.prior as i32 + rank_tweaks(name_flags(&path[cut + 1..]), o.kind, o.mtime, now);
                         out.push(Hit { score, idx: u32::MAX, over: Some(path.clone()) });
                     }
-                    (out, priors)
+                    (out, memo)
                 },
             )
             .map(|(out, _)| out)

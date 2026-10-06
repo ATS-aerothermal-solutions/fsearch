@@ -10,7 +10,7 @@ use crate::index::{Index, enc_size};
 use crate::walk::{self, FLAG_MOUNT, KIND_DIR, Listing, NONE, RawEnt};
 use std::collections::{BTreeMap, HashMap};
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy)]
 pub struct OEnt {
     pub kind: u8,
     pub size: u64,
@@ -18,13 +18,15 @@ pub struct OEnt {
     /// Char mask of the entry's name, so a search rejects most of the
     /// overlay with one AND.
     pub mask: u64,
+    /// Location prior of the nearest folder the base knows (set on insert).
+    pub prior: i8,
 }
 
 impl OEnt {
     /// `path` may be the whole path or just the name.
     pub fn new(path: &[u8], kind: u8, size: u64, mtime: u32) -> OEnt {
         let name = &path[path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1)..];
-        OEnt { kind, size, mtime, mask: crate::index::char_mask(name) }
+        OEnt { kind, size, mtime, mask: crate::index::char_mask(name), prior: 0 }
     }
 }
 
@@ -42,6 +44,18 @@ pub struct Live {
     pub names_cache: crate::query::NameCache,
     /// Wall-clock second up to which every change is known applied.
     pub synced_at: u32,
+    /// Overlay folder -> prior of its nearest base folder.
+    priors: HashMap<Vec<u8>, i8>,
+}
+
+/// What `Live::fetch` read from disk for one folder update.
+pub struct Fetched {
+    path: Vec<u8>,
+    recursive: bool,
+    blocked: bool,
+    attrs: Option<OEnt>,
+    listing: Option<Listing>,
+    scans: HashMap<Vec<u8>, Vec<Listing>>,
 }
 
 pub enum Applied {
@@ -56,7 +70,29 @@ impl Live {
         let words = base.n.div_ceil(64);
         let event_id = base.event_id;
         let synced_at = base.synced_at;
-        Live { base, dead: vec![0; words], dead_count: 0, over: BTreeMap::new(), event_id, trees: Vec::new(), names_cache: Default::default(), synced_at }
+        Live { base, dead: vec![0; words], dead_count: 0, over: BTreeMap::new(), event_id, trees: Vec::new(), names_cache: Default::default(), synced_at, priors: HashMap::new() }
+    }
+
+    /// Put an entry in the overlay, stamping the prior it ranks with.
+    fn put(&mut self, path: Vec<u8>, mut e: OEnt) {
+        let cut = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
+        e.prior = match self.priors.get(&path[..cut]) {
+            Some(&p) => p,
+            None => {
+                let mut up = &path[..cut];
+                let mut prior = 0;
+                while !up.is_empty() {
+                    if let Some(d) = self.base.lookup(up).and_then(|e| self.base.dir_of(e)) {
+                        prior = self.base.dir_prior()[d as usize];
+                        break;
+                    }
+                    up = &up[..up.iter().rposition(|&b| b == b'/').unwrap_or(0)];
+                }
+                self.priors.insert(path[..cut].to_vec(), prior);
+                prior
+            }
+        };
+        self.over.insert(path, e);
     }
 
     #[inline]
@@ -107,68 +143,132 @@ impl Live {
     /// Bring one directory (or, with `recursive`, its whole subtree) in line
     /// with the disk.
     pub fn apply_dir(&mut self, path: &[u8], recursive: bool) -> Applied {
+        let f = self.fetch(path, recursive);
+        self.apply(f)
+    }
+
+    /// The disk half of `apply_dir`: list the folder (or stat it) and scan
+    /// any folder that will be new to the index. Needs only `&self`, so the
+    /// caller does this under a read lock and searches keep answering.
+    pub fn fetch(&self, path: &[u8], recursive: bool) -> Fetched {
         let p = normalize(path);
+        let mut f = Fetched { path: p, recursive, blocked: false, attrs: None, listing: None, scans: HashMap::new() };
         // Not even an lstat inside folders we may not touch.
-        if walk::blocked(&p) {
-            return Applied::Done;
+        if walk::blocked(&f.path) {
+            f.blocked = true;
+            return f;
         }
         if recursive {
-            if p == b"/" {
-                return Applied::Rebuild;
+            if f.path != b"/" {
+                f.attrs = lstat(&f.path);
+                if f.attrs.is_some_and(|a| a.kind & 3 == KIND_DIR && a.kind & FLAG_MOUNT == 0) {
+                    f.scans.insert(f.path.clone(), walk::scan(&f.path, 4).0);
+                }
             }
-            self.remove_path(&p);
-            if let Some(attrs) = lstat(&p) {
-                self.add_new(p, attrs);
-            }
-            return Applied::Done;
+            return f;
         }
-        let Some(listing) = walk::list_one(&p) else {
-            if lstat(&p).is_none() {
-                self.remove_path(&p);
-            }
-            return Applied::Done;
+        let Some(listing) = walk::list_one(&f.path) else {
+            f.attrs = lstat(&f.path);
+            return f;
         };
+        // Children that will be added as folders get their subtree scanned now.
+        let cur = self.current_children(&f.path);
+        for r in &listing.ents {
+            if r.kind & 3 != KIND_DIR || r.kind & FLAG_MOUNT != 0 {
+                continue;
+            }
+            let name = &listing.names[r.name_off as usize..][..r.name_len as usize];
+            let was_dir = match cur.get(name) {
+                Some(Some(c)) => self.base.kind()[*c as usize] & 3 == KIND_DIR,
+                Some(None) => self.over.get(&join(&f.path, name)).is_some_and(|o| o.kind & 3 == KIND_DIR),
+                None => false,
+            };
+            if !was_dir {
+                let child = join(&f.path, name);
+                let ls = walk::scan(&child, 4).0;
+                f.scans.insert(child, ls);
+            }
+        }
+        f.listing = Some(listing);
+        f
+    }
+
+    /// Children the index holds for `p`: name -> base entry, or None for an
+    /// overlay entry.
+    fn current_children(&self, p: &[u8]) -> HashMap<Vec<u8>, Option<u32>> {
         let mut cur: HashMap<Vec<u8>, Option<u32>> = HashMap::new();
-        if let Some(d) = self.base_alive(&p).and_then(|e| self.base.dir_of(e)) {
+        if let Some(d) = self.base_alive(p).and_then(|e| self.base.dir_of(e)) {
             for c in self.base.children(d) {
                 if !self.is_dead(c as u32) {
                     cur.insert(self.base.name(c).to_vec(), Some(c as u32));
                 }
             }
         }
-        let (lo, hi) = subtree_bounds(&p);
+        let (lo, hi) = subtree_bounds(p);
         let plen = lo.len();
         for k in self.over.range(lo..hi).map(|(k, _)| k) {
             if !k[plen..].contains(&b'/') {
                 cur.insert(k[plen..].to_vec(), None);
             }
         }
+        cur
+    }
+
+    /// The memory half of `apply_dir`: diff what `fetch` read into the index.
+    pub fn apply(&mut self, mut f: Fetched) -> Applied {
+        if f.blocked {
+            return Applied::Done;
+        }
+        let p = std::mem::take(&mut f.path);
+        if f.recursive {
+            if p == b"/" {
+                return Applied::Rebuild;
+            }
+            self.remove_path(&p);
+            if let Some(attrs) = f.attrs {
+                let scan = f.scans.remove(&p);
+                self.add_new(p, attrs, scan);
+            }
+            return Applied::Done;
+        }
+        let Some(listing) = f.listing else {
+            if f.attrs.is_none() {
+                self.remove_path(&p);
+            }
+            return Applied::Done;
+        };
+        let mut cur = self.current_children(&p);
         for r in &listing.ents {
             let name = &listing.names[r.name_off as usize..][..r.name_len as usize];
             let child = join(&p, name);
             let now = OEnt::new(name, r.kind, r.size, r.mtime);
             match cur.remove(name) {
-                None => self.add_new(child, now),
+                None => {
+                    let scan = f.scans.remove(&child);
+                    self.add_new(child, now, scan)
+                }
                 Some(Some(c)) => {
                     let c = c as usize;
                     let was_kind = self.base.kind()[c];
                     if was_kind & 3 != now.kind & 3 {
                         self.kill_subtree(c as u32);
-                        self.add_new(child, now);
+                        let scan = f.scans.remove(&child);
+                        self.add_new(child, now, scan);
                     } else if now.kind & 3 != KIND_DIR
                         && (self.base.size_raw()[c] != enc_size(now.size) || self.base.mtime()[c] != now.mtime)
                     {
                         self.kill(c as u32);
-                        self.over.insert(child, now);
+                        self.put(child, now);
                     }
                 }
                 Some(None) => {
                     let old = self.over[&child];
                     if old.kind & 3 != now.kind & 3 {
                         self.drop_over_subtree(&child);
-                        self.add_new(child, now);
-                    } else if old != now {
-                        self.over.insert(child, now);
+                        let scan = f.scans.remove(&child);
+                        self.add_new(child, now, scan);
+                    } else if (old.kind, old.size, old.mtime) != (now.kind, now.size, now.mtime) {
+                        self.put(child, now);
                     }
                 }
             }
@@ -193,18 +293,19 @@ impl Live {
         Applied::Done
     }
 
-    /// Add an entry, scanning its subtree if it is a directory.
-    fn add_new(&mut self, path: Vec<u8>, e: OEnt) {
+    /// Add an entry and, if it is a directory, its subtree (`scan`, read
+    /// ahead by `fetch`; scanned here if missing).
+    fn add_new(&mut self, path: Vec<u8>, e: OEnt, scan: Option<Vec<Listing>>) {
         let is_dir = e.kind & 3 == KIND_DIR && e.kind & FLAG_MOUNT == 0;
-        self.over.insert(path.clone(), e);
+        self.put(path.clone(), e);
         if !is_dir {
             return;
         }
         self.trees.push(path.clone());
-        let (ls, _) = walk::scan(&path, 4);
+        let ls = scan.unwrap_or_else(|| walk::scan(&path, 4).0);
         for_each_path(&ls, &path, |p, r| {
             let e = OEnt::new(&p, r.kind, r.size, r.mtime);
-            self.over.insert(p, e);
+            self.put(p, e);
         });
     }
 

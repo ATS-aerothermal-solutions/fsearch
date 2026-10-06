@@ -535,9 +535,11 @@ fn relist_changed(shared: &Shared, why: &str, flags: u32) {
     dirs.sort();
     dirs.dedup();
     let stat_time = t.elapsed();
-    // One folder per lock hold, so searches keep answering meanwhile.
+    // Disk reads under the read lock, one folder per write, so searches keep
+    // answering meanwhile.
     for d in &dirs {
-        shared.live.write().unwrap().as_mut().unwrap().apply_dir(d, false);
+        let f = shared.live.read().unwrap().as_ref().unwrap().fetch(d, false);
+        shared.live.write().unwrap().as_mut().unwrap().apply(f);
     }
     let trees = {
         let mut g = shared.live.write().unwrap();
@@ -583,11 +585,18 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
             }
             let mut rebuild = false;
             let mut trees = Vec::new();
+            // Read the disk under the read lock, then apply in memory: a
+            // search never waits on a folder listing or a new subtree's scan.
+            let fetched: Vec<_> = {
+                let g = shared.live.read().unwrap();
+                let live = g.as_ref().unwrap();
+                dirs.iter().map(|(p, recursive)| live.fetch(p, *recursive)).collect()
+            };
             {
                 let mut g = shared.live.write().unwrap();
                 let live = g.as_mut().unwrap();
-                for (p, recursive) in &dirs {
-                    if let Applied::Rebuild = live.apply_dir(p, *recursive) {
+                for f in fetched {
+                    if let Applied::Rebuild = live.apply(f) {
                         rebuild = true;
                     }
                 }
