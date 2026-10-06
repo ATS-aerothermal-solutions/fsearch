@@ -72,7 +72,7 @@ thread_local! {
 
 /// Scan `root` recursively. Listing id 0 is `root` itself.
 pub fn scan(root: &[u8], threads: usize) -> (Vec<Listing>, Stats) {
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).start_handler(|_| crate::no_materialize()).build().unwrap();
     let ctx = Ctx {
         next_id: AtomicU32::new(1),
         out: (0..threads + 1).map(|_| Mutex::new(Vec::new())).collect(),

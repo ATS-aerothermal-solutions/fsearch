@@ -1,10 +1,6 @@
-mod content;
-mod fsevents;
-mod index;
-mod live;
-mod query;
 mod server;
-mod walk;
+
+use fsearch::{index, live, query};
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{BufRead, BufReader, Write};

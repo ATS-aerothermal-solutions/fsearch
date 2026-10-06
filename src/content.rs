@@ -917,7 +917,14 @@ pub struct GrepResult {
 /// 16), so candidate reads get their own small pool.
 fn read_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(4).thread_name(|i| format!("fsearch-read-{i}")).build().unwrap())
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .thread_name(|i| format!("fsearch-read-{i}"))
+            .start_handler(|_| crate::no_materialize())
+            .build()
+            .unwrap()
+    })
 }
 
 pub struct FileMatches {
@@ -1207,9 +1214,9 @@ pub fn verify_owned(g: &Grep, paths: Vec<Vec<u8>>, limit: usize) -> GrepResult {
 }
 
 /// Open a path for reading only if it is a regular file, never blocking:
-/// O_NONBLOCK keeps a FIFO from hanging open(), and the process-wide
-/// "don't materialize dataless files" policy (set in main) keeps iCloud
-/// placeholders from being downloaded just because we searched.
+/// O_NONBLOCK keeps a FIFO from hanging open(), and the read threads'
+/// "don't materialize dataless files" policy keeps iCloud placeholders from
+/// being downloaded just because we searched.
 pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
