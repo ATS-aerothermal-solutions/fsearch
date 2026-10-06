@@ -429,7 +429,26 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
         let (_, st, len, _) = splits[si].docs[k];
         &splits[si].flat[st as usize..(st + len) as usize]
     };
-    // Counting sort of (trigram, doc) pairs into per-trigram lists.
+    let pairs: usize = (0..order.len()).map(|d| tris(d).len()).sum();
+    if pairs < 1 << 22 {
+        // Small batch (the usual incremental update): sort the pairs. Cost
+        // scales with the batch, not with the 16.7M-slot trigram space.
+        let mut v: Vec<u64> = Vec::with_capacity(pairs);
+        for d in 0..order.len() {
+            v.extend(tris(d).iter().map(|&t| (t as u64) << 32 | d as u64));
+        }
+        v.sort_unstable();
+        let mut i = 0;
+        return write_segment(dir, id, &meta, |list| {
+            let t = (*v.get(i)? >> 32) as u32;
+            while i < v.len() && (v[i] >> 32) as u32 == t {
+                list.push(v[i] as u32);
+                i += 1;
+            }
+            Some(t)
+        });
+    }
+    // Big batch (initial build): counting sort over the whole trigram space.
     let mut count = vec![0u32; 1 << 24];
     for d in 0..order.len() {
         for &x in tris(d) {

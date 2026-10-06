@@ -18,12 +18,13 @@ fsearch stdio                   # JSON lines on stdin/stdout
 | multi-word name query | ~7-9 ms |
 | folder-scoped query (`in:`) | ~1 ms |
 | content query (typical literal/regex) | 3-15 ms |
-| content worst case (common-letter identifier) | best matches within the 250 ms budget |
+| content worst case (common-letter identifier) | best matches within the 250 ms budget (`budget_ms`) |
 | CLI end to end (spawn + query + print) | ~5.5 ms |
 | `fd` for the same name, no index | 25.9 s |
 | first-ever crawl of the whole disk | ~20 s, then never again |
 | content index first build | ~26 s |
-| daemon idle footprint | ~22 MB (index pages are clean, evictable mmap) |
+| daemon idle footprint | ~11-22 MB (index pages are clean, evictable mmap) |
+| daemon idle CPU | ~0.5% averaged (following the disk's FSEvents churn) |
 | on disk | 255 MB names + ~700 MB content |
 
 The crawl is bound by two Endpoint Security clients on this Mac (MDM,
