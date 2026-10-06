@@ -388,7 +388,6 @@ struct Split {
 /// to be text are recorded with no trigrams.
 pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<usize>) -> Option<Segment> {
     use std::io::Read;
-    use std::os::unix::ffi::OsStrExt;
     let splits: Vec<Split> = range
         .clone()
         .into_par_iter()
@@ -397,9 +396,9 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
             || Split { seen: vec![0u64; (1 << 24) / 64], buf: Vec::new(), flat: Vec::new(), docs: Vec::new() },
             |mut sp, i| {
                 sp.buf.clear();
-                let ok = std::fs::File::open(std::ffi::OsStr::from_bytes(docs.path(i)))
-                    .and_then(|mut f| f.read_to_end(&mut sp.buf))
-                    .is_ok_and(|n| n as u64 <= MAX_FILE && memchr::memchr(0, &sp.buf[..n.min(8192)]).is_none());
+                let ok = open_regular(docs.path(i))
+                    .and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut sp.buf).ok())
+                    .is_some_and(|n| n as u64 <= MAX_FILE && memchr::memchr(0, &sp.buf[..n.min(8192)]).is_none());
                 let start = sp.flat.len() as u32;
                 if ok {
                     trigrams(&sp.buf, &mut sp.seen, &mut sp.flat);
@@ -939,9 +938,8 @@ thread_local! {
 fn match_file(g: &Grep, path: &[u8]) -> Option<FileMatches> {
     READ_BUF.with_borrow_mut(|buf| {
         use std::io::Read;
-        use std::os::unix::ffi::OsStrExt;
         buf.clear();
-        let mut f = std::fs::File::open(std::ffi::OsStr::from_bytes(path)).ok()?;
+        let mut f = open_regular(path)?;
         Read::take(&mut f, MAX_FILE * 4).read_to_end(buf).ok()?;
         match_buf(g, path, buf)
     })
@@ -1155,11 +1153,10 @@ fn regex_plan(h: &Hir) -> TQ {
     and(i.q, i.exact.map_or(TQ::All, |e| exact_query(&e)))
 }
 
-/// Grep files the content index does not cover (e.g. `in:/etc`), using the
-/// name index to pick files instead of crawling. `q` is the name query
-/// restricted to the files worth reading.
-pub fn scan(g: &Grep, live: &Live, mut q: Query) -> GrepResult {
-    let limit = q.limit;
+/// Files to grep where the content index does not reach (e.g. `in:/etc`),
+/// picked from the name index instead of crawling, newest first. `q` is the
+/// name query restricted to the files worth reading.
+pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
     q.kind = Some(KIND_FILE);
     q.limit = 200_000;
     q.size = (q.size.0, q.size.1.min(MAX_FILE));
@@ -1179,8 +1176,23 @@ pub fn scan(g: &Grep, live: &Live, mut q: Query) -> GrepResult {
         });
     }
     files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
-    let paths: Vec<&[u8]> = files.iter().map(|(p, _)| p.as_slice()).collect();
-    let mut r = verify(g, &paths, limit);
-    r.candidates = paths.len();
+    files.into_iter().map(|(p, _)| p).collect()
+}
+
+pub fn verify_owned(g: &Grep, paths: Vec<Vec<u8>>, limit: usize) -> GrepResult {
+    let refs: Vec<&[u8]> = paths.iter().map(Vec::as_slice).collect();
+    let mut r = verify(g, &refs, limit);
+    r.candidates = refs.len();
     r
+}
+
+/// Open a path for reading only if it is a regular file, never blocking:
+/// O_NONBLOCK keeps a FIFO from hanging open(), and the process-wide
+/// "don't materialize dataless files" policy (set in main) keeps iCloud
+/// placeholders from being downloaded just because we searched.
+pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(std::ffi::OsStr::from_bytes(path)).ok()?;
+    f.metadata().ok()?.is_file().then_some(f)
 }

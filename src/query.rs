@@ -155,6 +155,23 @@ impl Query {
 }
 
 impl Query {
+    /// The parts of a query that pick files for a content scan.
+    pub fn clone_for_scan(&self) -> Query {
+        Query {
+            tokens: self.tokens.iter().map(|t| Token { text: t.text.clone(), mask: t.mask, mode: t.mode, negate: t.negate }).collect(),
+            kind: self.kind,
+            exts: self.exts.clone(),
+            scope: self.scope.clone(),
+            size: self.size,
+            mtime: self.mtime,
+            name_re: self.name_re.clone(),
+            path_re: self.path_re.clone(),
+            limit: self.limit,
+            grep: None,
+            grep_mode: self.grep_mode,
+        }
+    }
+
     /// Does a full path pass every filter and token? Returns the match score.
     /// Used where there is no dir memo: the overlay and content-search docs.
     pub fn match_path(&self, path: &[u8], kind: u8, size: u64, mtime: u32) -> Option<i32> {

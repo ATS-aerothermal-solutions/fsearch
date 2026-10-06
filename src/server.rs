@@ -18,7 +18,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 const COMPACT_PENDING: usize = 200_000;
-const COMPACT_EVERY: Duration = Duration::from_secs(30 * 60);
+// Saving rewrites ~250 MB; restart replays FSEvents history anyway, so
+// only persist twice a day (or when the overlay gets big).
+const COMPACT_EVERY: Duration = Duration::from_secs(12 * 3600);
 const SCAN_THREADS: usize = 8;
 
 pub struct Shared {
@@ -49,6 +51,23 @@ pub fn serve(dir: PathBuf, home: String) {
     if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         log("another fsearch daemon is running");
         return;
+    }
+    let fda = has_full_disk_access() && std::env::var_os("FSEARCH_RESTRICT").is_none();
+    if !fda {
+        let h = home.as_str();
+        let skip = [
+            format!("{h}/Desktop"),
+            format!("{h}/Documents"),
+            format!("{h}/Downloads"),
+            format!("{h}/Library/Mobile Documents"),
+            format!("{h}/Library/Containers"),
+            format!("{h}/Library/Group Containers"),
+            format!("{h}/Library/CloudStorage"),
+            format!("{h}/Pictures/Photos Library.photoslibrary"),
+            "/Volumes".to_string(),
+        ];
+        log("no Full Disk Access: skipping consent-gated folders (grant it to fsearch to index everything)");
+        let _ = walk::SKIP.set(skip.into_iter().map(String::into_bytes).collect());
     }
     let idx_path = dir.join("index.bin");
     let base = Index::load(&idx_path);
@@ -163,6 +182,12 @@ fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
         }
         release_memory();
     }
+}
+
+/// The system TCC database is readable only with Full Disk Access, and
+/// trying without it fails immediately (no prompt).
+fn has_full_disk_access() -> bool {
+    std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
 }
 
 fn full_build(shared: &Shared, event_id: u64) -> Index {
@@ -311,6 +336,14 @@ fn run(v: &Value, shared: &Shared) -> Result<Value, String> {
         let _ = shared.wake.send(Vec::new());
         return Ok(json!({"ok": true, "scheduled": true}));
     }
+    // Content search reads files, which can be slow; it must not sit on the
+    // name-index lock (a waiting writer would stall every other query).
+    let is_grep = op == "grep"
+        || (op == "search"
+            && v.get("q").and_then(Value::as_str).is_some_and(|q| ["grep:", "regex:", "sym:", "content:", "symbol:"].iter().any(|k| q.contains(k))));
+    if is_grep {
+        return grep(v, shared);
+    }
     let g = shared.live.read().unwrap();
     let Some(live) = g.as_ref() else { return Err("indexing (first run scans the whole disk, ~20s)".into()) };
     match op {
@@ -326,9 +359,8 @@ fn run(v: &Value, shared: &Shared) -> Result<Value, String> {
             "content_segments": shared.content.read().unwrap().segs.len(),
             "content_bytes": shared.content.read().unwrap().bytes(),
             "content_pending": shared.content_pending.load(Ordering::Relaxed),
+            "full_disk_access": walk::SKIP.get().is_none(),
         })),
-        "grep" => grep(v, shared, live),
-        "search" if v.get("q").and_then(Value::as_str).is_some_and(|q| q.contains("grep:") || q.contains("regex:") || q.contains("sym:") || q.contains("content:") || q.contains("symbol:")) => grep(v, shared, live),
         "search" => {
             let q = parse_request(v, &shared.home)?;
             let t = Instant::now();
@@ -367,7 +399,7 @@ fn run(v: &Value, shared: &Shared) -> Result<Value, String> {
 /// Content search. The pattern comes from `pattern` (+ `mode`) or from a
 /// `grep:`/`regex:`/`sym:` filter in `q`; the rest of the query narrows
 /// which files are read.
-fn grep(v: &Value, shared: &Shared, live: &Live) -> Result<Value, String> {
+fn grep(v: &Value, shared: &Shared) -> Result<Value, String> {
     let mut q = parse_request(v, &shared.home)?;
     let mode = match v.get("mode").and_then(Value::as_str) {
         Some("regex") => GrepMode::Regex,
@@ -387,7 +419,17 @@ fn grep(v: &Value, shared: &Shared, live: &Live) -> Result<Value, String> {
     let t = Instant::now();
     let home = shared.home.as_bytes();
     let indexed = q.scope.as_ref().is_none_or(|s| content::in_scope(s, home));
-    let r = if indexed { shared.content.read().unwrap().search(&g, &q) } else { content::scan(&g, live, q) };
+    let r = if indexed {
+        shared.content.read().unwrap().search(&g, &q)
+    } else {
+        // Pick files under the lock, read them after releasing it.
+        let paths = {
+            let g = shared.live.read().unwrap();
+            let Some(live) = g.as_ref() else { return Err("indexing".into()) };
+            content::scan_paths(live, q.clone_for_scan())
+        };
+        content::verify_owned(&g, paths, q.limit)
+    };
     let files: Vec<Value> = r
         .files
         .iter()
@@ -446,8 +488,16 @@ pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
         return Ok(s);
     }
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log"))?;
-    std::process::Command::new(std::env::current_exe()?)
-        .arg("serve")
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    // Own session: closing the terminal that started it doesn't kill it.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.arg("serve")
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)

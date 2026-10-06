@@ -92,6 +92,10 @@ impl Live {
     /// with the disk.
     pub fn apply_dir(&mut self, path: &[u8], recursive: bool) -> Applied {
         let p = normalize(path);
+        // Not even an lstat inside folders we may not touch.
+        if walk::blocked(&p) {
+            return Applied::Done;
+        }
         if recursive {
             if p == b"/" {
                 return Applied::Rebuild;

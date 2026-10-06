@@ -4,11 +4,42 @@ Whole-disk file search for macOS: fuzzy names, filters, and indexed content
 grep, served by a small daemon over a local JSON-lines API.
 
 ```
-fsearch install                 # copy to ~/.local/bin, run as a LaunchAgent
-fsearch fsearch main            # fuzzy name search
+cargo build --release && ./target/release/fsearch install   # -> ~/.local/bin/fsearch
+fsearch fsearch main            # fuzzy name search (starts the daemon on first use)
 fsearch 'ext:rs grep:apply_dir' # content search, narrowed by name filters
 fsearch stdio                   # JSON lines on stdin/stdout
 ```
+
+## Numbers (M4 Max, this Mac: 7.49M files and folders, 513k text files indexed)
+
+| | |
+|---|---|
+| one-word name query, whole disk | ~1.3 ms in the daemon |
+| multi-word name query | ~7-9 ms |
+| folder-scoped query (`in:`) | ~1 ms |
+| content query (typical literal/regex) | 3-15 ms |
+| content worst case (common-letter identifier) | best matches within the 250 ms budget |
+| CLI end to end (spawn + query + print) | ~5.5 ms |
+| `fd` for the same name, no index | 25.9 s |
+| first-ever crawl of the whole disk | ~20 s, then never again |
+| content index first build | ~26 s |
+| daemon idle footprint | ~22 MB (index pages are clean, evictable mmap) |
+| on disk | 255 MB names + ~700 MB content |
+
+The crawl is bound by two Endpoint Security clients on this Mac (MDM,
+VPN) that tax every `open()` (~19 µs per directory); file reads peak at
+4 threads for the same reason, so content reads use a 4-thread pool.
+
+## Full Disk Access
+
+Started from a terminal that has Full Disk Access, the daemon inherits it
+and indexes everything. Run any other way (e.g. as a login item) it needs its
+own grant: System Settings > Privacy & Security > Full Disk Access > add
+`~/.local/bin/fsearch`, then `fsearch install --login`. Without the grant
+it detects that at startup and stays out of consent-gated folders
+(Desktop, Documents, Downloads, iCloud, app containers, CloudStorage,
+/Volumes) instead of blocking on a privacy prompt. It never downloads iCloud
+placeholders and never blocks on FIFOs.
 
 ## How it works
 

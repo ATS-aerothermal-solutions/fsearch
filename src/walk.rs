@@ -13,6 +13,15 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const NONE: u32 = u32::MAX;
 
+/// Folders never to open: set when the daemon runs without Full Disk
+/// Access, where opening a consent-gated folder (Downloads, Desktop, ...)
+/// pops a privacy prompt and blocks the call until someone answers it.
+pub static SKIP: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+
+pub fn blocked(path: &[u8]) -> bool {
+    SKIP.get().is_some_and(|v| v.iter().any(|s| path.starts_with(s) && (path.len() == s.len() || path[s.len()] == b'/')))
+}
+
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
 const DIR_MNTSTATUS_TRIGGER: u32 = 0x2;
 
@@ -70,8 +79,10 @@ pub fn scan(root: &[u8], threads: usize) -> (Vec<Listing>, Stats) {
         stats: Stats::default(),
     };
     raise_fd_limit();
-    let fd = CString::new(root).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) });
-    pool.scope(|s| finish_dir(s, fd, 0, &ctx));
+    let fd = if blocked(root) { -1 } else { CString::new(root).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) }) };
+    // Paths are only tracked when there is something to skip.
+    let path = SKIP.get().is_some_and(|v| !v.is_empty()).then(|| root.to_vec());
+    pool.scope(|s| finish_dir(s, fd, path, 0, &ctx));
     let mut all = Vec::new();
     for m in ctx.out {
         all.append(&mut m.into_inner().unwrap());
@@ -89,6 +100,9 @@ fn raise_fd_limit() {
 /// List a single directory (no recursion). Subdirectories come back with
 /// `child == NONE`. Used by the live updater.
 pub fn list_one(path: &[u8]) -> Option<Listing> {
+    if blocked(path) {
+        return None;
+    }
     let mut l = Listing { id: 0, names: Vec::new(), ents: Vec::new() };
     list_into(path, &mut l).then_some(l)
 }
@@ -107,7 +121,7 @@ impl Drop for Fd {
 // never get rebuilt and PATH_MAX never bites. Measured on this Mac: open() +
 // close() is ~19us per directory (two Endpoint Security clients tax every
 // open), getattrlistbulk ~14us; past ~8 threads the kernel side stops scaling.
-fn finish_dir<'s>(s: &Scope<'s>, fd: i32, id: u32, ctx: &'s Ctx) {
+fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &'s Ctx) {
     let mut l = Listing { id, names: Vec::new(), ents: Vec::new() };
     if fd < 0 {
         ctx.stats.denied.fetch_add(1, Ordering::Relaxed);
@@ -119,20 +133,24 @@ fn finish_dir<'s>(s: &Scope<'s>, fd: i32, id: u32, ctx: &'s Ctx) {
     let mut kids = Vec::new();
     for e in l.ents.iter_mut() {
         if e.kind & 3 == KIND_DIR && e.kind & FLAG_MOUNT == 0 {
-            e.child = ctx.next_id.fetch_add(1, Ordering::Relaxed);
             let name = &l.names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
-            kids.push((CString::new(name).unwrap_or_default(), e.child));
+            let child_path = path.as_ref().map(|p| crate::live::join(p, name));
+            if child_path.as_deref().is_some_and(blocked) {
+                continue;
+            }
+            e.child = ctx.next_id.fetch_add(1, Ordering::Relaxed);
+            kids.push((CString::new(name).unwrap_or_default(), e.child, child_path));
         }
     }
     ctx.stats.dirs.fetch_add(1, Ordering::Relaxed);
     ctx.stats.entries.fetch_add(l.ents.len() as u64, Ordering::Relaxed);
     push(l, ctx);
-    for (name, cid) in kids {
+    for (name, cid, child_path) in kids {
         let parent = me.clone();
         s.spawn(move |s| {
             let fd = unsafe { libc::openat(parent.0, name.as_ptr(), OPEN_DIR) };
             drop(parent);
-            finish_dir(s, fd, cid, ctx);
+            finish_dir(s, fd, child_path, cid, ctx);
         });
     }
 }

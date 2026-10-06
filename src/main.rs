@@ -60,8 +60,9 @@ const USAGE: &str = "usage:
   fsearch stdio                 JSON lines on stdin/stdout
   fsearch serve                 run the daemon in the foreground
   fsearch status
-  fsearch install               copy to ~/.local/bin and run the daemon as a LaunchAgent
-  fsearch uninstall             remove the LaunchAgent (keeps the index)
+  fsearch install [--login]      copy to ~/.local/bin; --login also starts the daemon at login
+                                (needs Full Disk Access granted to ~/.local/bin/fsearch)
+  fsearch uninstall             remove the login agent (keeps the index)
   fsearch bench <query...>      time a query in-process against the saved index";
 
 const LABEL: &str = "mt.nd.fsearch";
@@ -76,7 +77,15 @@ fn data_dir() -> PathBuf {
     d
 }
 
+unsafe extern "C" {
+    fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+}
+
 fn main() {
+    // Never let a search download iCloud placeholders: opening or listing a
+    // dataless file/dir fails fast instead of materializing it.
+    // (IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, OFF)
+    unsafe { setiopolicy_np(3, 0, 1) };
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None | Some("-h" | "--help") => eprintln!("{USAGE}"),
@@ -84,7 +93,7 @@ fn main() {
         Some("stdio") => stdio(),
         Some("status") => print_one(&serde_json::json!({"op": "status"}), true),
         Some("bench") => bench(&args[1..].join(" ")),
-        Some("install") => install(),
+        Some("install") => install(args.iter().any(|a| a == "--login")),
         Some("uninstall") => uninstall(),
         Some(_) => {
             let json = args.iter().any(|a| a == "--json");
@@ -166,20 +175,24 @@ fn plist_path() -> PathBuf {
 }
 
 fn launchctl(args: &[&str]) -> bool {
-    std::process::Command::new("launchctl").args(args).status().is_ok_and(|s| s.success())
+    std::process::Command::new("launchctl").args(args).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
 fn domain() -> String {
     format!("gui/{}", unsafe { libc::getuid() })
 }
 
-fn install() {
+fn install(login: bool) {
     let bin = PathBuf::from(home()).join(".local/bin/fsearch");
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     // Replace, never overwrite in place: a rewritten signed binary at the same
     // path can be SIGKILLed by the code-signing cache.
     let _ = std::fs::remove_file(&bin);
     std::fs::copy(std::env::current_exe().unwrap(), &bin).unwrap_or_else(|e| die(&format!("copy: {e}")));
+    if !login {
+        println!("installed {}; the daemon starts on first use", bin.display());
+        return;
+    }
     let log = data_dir().join("daemon.log");
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -202,7 +215,16 @@ fn install() {
     std::fs::write(plist_path(), plist).unwrap();
     let target = format!("{}/{LABEL}", domain());
     launchctl(&["bootout", &target]);
-    if !launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]) {
+    // bootout returns before the old job is fully gone; bootstrap fails
+    // until it is.
+    let ok = (0..50).any(|_| {
+        let done = launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
+        if !done {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        done
+    });
+    if !ok {
         die("launchctl bootstrap failed");
     }
     println!("installed {} (LaunchAgent {LABEL})", bin.display());
