@@ -192,6 +192,13 @@ impl Query {
         {
             return None;
         }
+        // A hit needs some token in its own name; most overlay paths fail
+        // here, before the path is split into folders.
+        let mut pos = self.tokens.iter().filter(|t| !t.negate).peekable();
+        let m = crate::index::char_mask(name);
+        if pos.peek().is_some() && !pos.any(|t| m & t.mask == t.mask && token_score(name, t).is_some()) {
+            return None;
+        }
         let dirs: Vec<&[u8]> = path[..cut].split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
         if self.tokens.iter().any(|t| t.negate && (token_matches(name, t) || dirs.iter().any(|d| token_matches(d, t)))) {
             return None;
