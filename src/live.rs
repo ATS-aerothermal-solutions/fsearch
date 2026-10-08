@@ -15,8 +15,8 @@ pub struct OEnt {
     pub kind: u8,
     pub size: u64,
     pub mtime: u32,
-    /// Char mask of the entry's name, so a search rejects most of the
-    /// overlay with one AND.
+    /// `index::name_mask` of the entry's name, so a search rejects most of
+    /// the overlay with one AND.
     pub mask: u64,
     /// Location prior of the nearest folder the base knows (set on insert).
     pub prior: i8,
@@ -26,7 +26,7 @@ impl OEnt {
     /// `path` may be the whole path or just the name.
     pub fn new(path: &[u8], kind: u8, size: u64, mtime: u32) -> OEnt {
         let name = &path[path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1)..];
-        OEnt { kind, size, mtime, mask: crate::index::char_mask(name), prior: 0 }
+        OEnt { kind, size, mtime, mask: crate::index::name_mask(name), prior: 0 }
     }
 }
 
