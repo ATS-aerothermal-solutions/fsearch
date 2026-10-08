@@ -77,6 +77,52 @@ The crawl is bound by two Endpoint Security clients on this Mac (MDM,
 VPN) that tax every `open()` (~19 µs per directory); file reads peak at
 4 threads for the same reason, so content reads use a 4-thread pool.
 
+## vs fff
+
+[fff](https://github.com/dmtrKovalenko/fff) (0.11.0) is a fuzzy file finder
+and grep library for editors and agents. Both ran on this Mac, with the
+same queries, on shallow clones of the two repos fff shows off: the Linux
+kernel (its demo) and Chromium (its README). fff indexes only that folder.
+fsearch searches its whole-disk index (7.7-8.3M entries), scoped to the folder.
+Video: `demo/fsearch-vs-fff.mp4`.
+
+| Chromium, 509k files | fsearch | fff |
+|---|---|---|
+| find a file by name, median / p90 | 1.1 / 1.5 ms | 13.8 / 19.2 ms |
+| right file #1: exact name / one typo | 100% / 98% | 99.7% / 88% |
+| search inside files, median / p90 | 5.6 / 41 ms | 53 / 584 ms |
+| first answer after launch | 50 ms | 2.5 s (12.8 s until content search is warm) |
+| memory footprint | 50 MB (whole disk) | 358 MB (this folder) |
+
+| Linux kernel, 96k files | fsearch | fff |
+|---|---|---|
+| find a file by name, median / p90 | 1.2 / 1.7 ms | 1.0 / 1.6 ms |
+| right file #1: exact name / one typo | 100% / 98% | 100% / 93% |
+| search inside files, median / p90 | 4.3 / 23 ms | 23 / 248 ms |
+| first answer after launch | 40 ms | 0.37 s (2.4 s until content search is warm) |
+| memory footprint | 71 MB (whole disk) | 146 MB (this folder) |
+
+fsearch's name search costs about the same at any folder size because it
+always scans the whole disk. fff's grows with the folder, so on the kernel
+it is level with fsearch, or a little ahead.
+
+How it was measured: name search used 300 file names unique in the folder
+plus 1,200 one-typo versions of them (swapped, missing, extra or wrong
+letter, never the first one), 50 results each. Content search used 67
+literal patterns (60 identifiers from random source files plus common ones),
+first 50 matching files, no time budget. fff ran in-process through its
+Python package and fsearch through its daemon socket, taking turns going
+first. "First answer" is a cold start of each with the OS file cache warm.
+Memory is the process footprint (what Activity Monitor shows). Neither
+counts clean mmapped file pages.
+
+fff greps every non-binary file, while fsearch's content index reads known
+text extensions and skips folders like `build/` and `vendor/`. So across all
+matches fff found 9% more files on Chromium (mostly `.gn`, `.mojom`, `.idl`)
+and 2.5% more on the kernel. Reproduce with `pip install fff-search`, then
+`python3 demo/vs_fff.py <folder>`. It needs `fd` and restarts the fsearch
+daemon once.
+
 ## Full Disk Access
 
 Started from a terminal that has Full Disk Access, the daemon inherits it
@@ -99,9 +145,11 @@ placeholders and never blocks on FIFOs.
 - **Name index** (`index.rs`): one mmap'd file. Entries are laid out one
   directory block at a time in DFS order, so any folder's subtree is a single
   contiguous range (`in:` is a range bound, not a filter). Names are interned
-  (7.5M entries share ~2M names) with a per-name character mask.
+  (7.5M entries share ~2M names) with a per-name character mask, whose spare
+  bits also hash the letter each word of the name starts with.
 - **Query** (`query.rs`): score each *distinct* name once (mask prefilter, then
-  an fzf-style fuzzy score), then score entries: a rare query visits only the
+  an fzf-style fuzzy score, or a one-typo reading of the word at the start of
+  the name or of a space-separated word in it), then score entries: a rare query visits only the
   entries carrying a matching name (a name -> entries list in the index), a
   common one makes one sequential pass with a table lookup each. Multi-word
   queries match words against the name or any folder on the path via a
@@ -135,7 +183,10 @@ placeholders and never blocks on FIFOs.
 
 ## Query language
 
-Words are fuzzy (all must match, the name or a folder on the path).
+Words are fuzzy (all must match, the name or a folder on the path). Words of
+5+ letters forgive one typo (a swapped, extra, missing or wrong letter, not the
+first one and never a digit): `mian.rs` finds `main.rs`, ranked below clean
+matches.
 `'exact`, `^prefix`, `suffix$`, `!exclude`. Filters:
 
 | filter | example |
