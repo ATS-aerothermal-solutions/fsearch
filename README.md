@@ -99,9 +99,11 @@ placeholders and never blocks on FIFOs.
 - **Name index** (`index.rs`): one mmap'd file. Entries are laid out one
   directory block at a time in DFS order, so any folder's subtree is a single
   contiguous range (`in:` is a range bound, not a filter). Names are interned
-  (7.5M entries share ~2M names) with a per-name character mask.
+  (7.5M entries share ~2M names) with a per-name character mask, whose spare
+  bits also hash the letter each word of the name starts with.
 - **Query** (`query.rs`): score each *distinct* name once (mask prefilter, then
-  an fzf-style fuzzy score), then score entries: a rare query visits only the
+  an fzf-style fuzzy score, or a one-typo reading of the word at the start of
+  the name or of a space-separated word in it), then score entries: a rare query visits only the
   entries carrying a matching name (a name -> entries list in the index), a
   common one makes one sequential pass with a table lookup each. Multi-word
   queries match words against the name or any folder on the path via a
@@ -135,7 +137,10 @@ placeholders and never blocks on FIFOs.
 
 ## Query language
 
-Words are fuzzy (all must match, the name or a folder on the path).
+Words are fuzzy (all must match, the name or a folder on the path). Words of
+5+ letters forgive one typo (a swapped, extra, missing or wrong letter, not the
+first one and never a digit): `mian.rs` finds `main.rs`, ranked below clean
+matches.
 `'exact`, `^prefix`, `suffix$`, `!exclude`. Filters:
 
 | filter | example |

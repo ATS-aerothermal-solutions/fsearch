@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"FSIDX006";
+const MAGIC: &[u8; 8] = b"FSIDX007";
 const HDR: usize = 4096;
 
 #[derive(Clone, Copy)]
@@ -278,7 +278,7 @@ impl Index {
         let u = ids.len();
         drop(ids);
         let mut umask = vec![0u64; u];
-        umask.par_iter_mut().enumerate().for_each(|(k, m)| *m = char_mask(&unames[uoff[k] as usize..uoff[k + 1] as usize]));
+        umask.par_iter_mut().enumerate().for_each(|(k, m)| *m = name_mask(&unames[uoff[k] as usize..uoff[k + 1] as usize]));
         let enc: Vec<u32> = size[..n].iter().map(|&s| enc_size(s)).collect();
         // Entries grouped by name (counting sort keeps them ascending).
         let mut ne_off = vec![0u32; u + 1];
@@ -467,6 +467,22 @@ fn offsets(lens: &[usize; NSEC]) -> ([usize; NSEC], usize) {
 /// the disk with one AND per entry.
 pub fn char_mask(s: &[u8]) -> u64 {
     s.iter().fold(0, |m, &b| m | char_bit(b))
+}
+
+/// A name's mask: `char_mask`, plus in the spare high bits a hash of the
+/// first byte of the name (past a leading dot) and of each space-separated
+/// word: where a typo match may start (`query::typo_score`), so a search
+/// rejects every other name without reading it.
+pub fn name_mask(s: &[u8]) -> u64 {
+    let off = (s.len() > 1 && s[0] == b'.') as usize;
+    let starts = s.get(off).into_iter().chain(s.windows(2).filter(|w| w[0] == b' ').map(|w| &w[1]));
+    starts.fold(char_mask(s), |m, &b| m | start_bit(b))
+}
+
+/// The `name_mask` bit for a word starting with `b` (bits 41..64).
+#[inline]
+pub fn start_bit(b: u8) -> u64 {
+    1 << (41 + b.to_ascii_lowercase() % 23)
 }
 
 #[inline]

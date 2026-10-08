@@ -1,6 +1,6 @@
 //! Name search: parse a query, scan the index in parallel, rank, top-k.
 
-use crate::index::char_bit;
+use crate::index::{char_bit, start_bit};
 use crate::live::Live;
 use crate::walk::{FLAG_HIDDEN, KIND_DIR, KIND_FILE, KIND_LINK};
 use rayon::prelude::*;
@@ -20,6 +20,32 @@ pub struct Token {
     pub mask: u64,
     pub mode: Mode,
     pub negate: bool,
+    /// Char classes a typo may leave out of a matching name: all but the
+    /// first letter's, or none when the token takes no typos.
+    pub loose: u64,
+    /// `index::start_bit` of the first letter when the token takes typos.
+    pub start: u64,
+}
+
+impl Token {
+    /// Can a name with mask `m` (`index::name_mask`) match? Cleanly it has
+    /// every char class; with a typo, a word in it starts with this token's
+    /// first letter and at most one `loose` class is missing. Branchless, so
+    /// the scan over every name stays vectorized.
+    #[inline(always)]
+    fn fits(&self, m: u64) -> bool {
+        let miss = self.mask & !m;
+        (miss == 0) | ((((miss & !self.loose) | (miss & miss.wrapping_sub(1))) == 0) & (m & self.start != 0))
+    }
+}
+
+/// Fuzzy words this long forgive one typo (see `typo_score`).
+const TYPO_MIN_LEN: usize = 5;
+/// What a typo costs, so clean matches of the same quality rank first.
+const TYPO_COST: i32 = 60;
+
+fn takes_typos(text: &[u8], mode: Mode) -> bool {
+    mode == Mode::Fuzzy && text.len() >= TYPO_MIN_LEN
 }
 
 #[derive(Default)]
@@ -101,7 +127,8 @@ impl Query {
         }
         let text: Vec<u8> = t.bytes().map(|b| b.to_ascii_lowercase()).collect();
         let mask = text.iter().fold(0, |m, &b| m | char_bit(b));
-        self.tokens.push(Token { text, mask, mode, negate });
+        let (loose, start) = if takes_typos(&text, mode) { (mask & !char_bit(text[0]), start_bit(text[0])) } else { (0, 0) };
+        self.tokens.push(Token { text, mask, mode, negate, loose, start });
     }
 
     pub fn filter(&mut self, k: &str, v: &str, home: &str) -> Result<(), String> {
@@ -158,7 +185,11 @@ impl Query {
     /// The parts of a query that pick files for a content scan.
     pub fn clone_for_scan(&self) -> Query {
         Query {
-            tokens: self.tokens.iter().map(|t| Token { text: t.text.clone(), mask: t.mask, mode: t.mode, negate: t.negate }).collect(),
+            tokens: self
+                .tokens
+                .iter()
+                .map(|t| Token { text: t.text.clone(), mask: t.mask, mode: t.mode, negate: t.negate, loose: t.loose, start: t.start })
+                .collect(),
             kind: self.kind,
             exts: self.exts.clone(),
             scope: self.scope.clone(),
@@ -201,8 +232,8 @@ impl Query {
         // A hit needs some token in its own name; most paths fail here,
         // before the folders are looked at.
         let mut pos = self.tokens.iter().filter(|t| !t.negate).peekable();
-        let m = crate::index::char_mask(name);
-        if pos.peek().is_some() && !pos.any(|t| m & t.mask == t.mask && token_score(name, t).is_some()) {
+        let m = crate::index::name_mask(name);
+        if pos.peek().is_some() && !pos.any(|t| t.fits(m) && token_score(name, m, t).is_some()) {
             return None;
         }
         if self.tokens.iter().any(|t| t.negate && token_matches(name, t)) {
@@ -216,7 +247,7 @@ impl Query {
         let all = (1u32 << pos.len()) - 1;
         let (mut got, mut inherited, mut score) = (0u32, 0u32, 0i32);
         for (t, tok) in pos.iter().enumerate() {
-            if let Some(s) = token_score(name, tok) {
+            if let Some(s) = token_score(name, m, tok) {
                 got |= 1 << t;
                 score += s;
             } else if let Some(s) = d.best[t] {
@@ -240,7 +271,7 @@ impl Query {
         let mut d = DirMatch { negated: false, best: [None; 8] };
         d.negated = self.tokens.iter().any(|t| t.negate && comps.iter().any(|c| token_matches(c, t)));
         for (t, tok) in self.tokens.iter().filter(|t| !t.negate).enumerate() {
-            d.best[t] = comps.iter().filter_map(|c| token_score(c, tok)).max();
+            d.best[t] = comps.iter().filter_map(|c| token_score(c, !0, tok)).max();
         }
         d
     }
@@ -397,6 +428,11 @@ fn bonus(prev: Class, cur: Class) -> i32 {
 /// fzf-v1 style: leftmost-ending match, shrunk from the right, then scored
 /// with boundary/camel/consecutive bonuses. Returns None when no match.
 pub fn fuzzy_score(name: &[u8], q: &[u8]) -> Option<i32> {
+    fuzzy_score_capped(name, q, 100)
+}
+
+/// `fuzzy_score` with the whole-name/stem/prefix bonus capped at `cap`.
+fn fuzzy_score_capped(name: &[u8], q: &[u8], cap: i32) -> Option<i32> {
     // Leftmost-ending match: jump to each query byte in turn (memchr is
     // SIMD; most names fail on the first or second byte).
     let mut end = 0;
@@ -406,7 +442,7 @@ pub fn fuzzy_score(name: &[u8], q: &[u8]) -> Option<i32> {
         from = end + 1;
     }
     if q.len() == 1 {
-        return Some(single_score(name, end));
+        return Some(single_score(name, end, cap));
     }
     // Shrink from the right: the latest start that still ends at `end`.
     let mut start = end + 1;
@@ -445,14 +481,16 @@ pub fn fuzzy_score(name: &[u8], q: &[u8]) -> Option<i32> {
     let off = (name.len() > 1 && name[0] == b'.') as usize;
     let stem = name.iter().rposition(|&b| b == b'.').filter(|&p| p > off).unwrap_or(name.len());
     let contiguous = end + 1 - start == q.len();
-    if start == off && contiguous && end + 1 == name.len() {
-        score += 100;
+    let placed = if start == off && contiguous && end + 1 == name.len() {
+        100
     } else if start == off && contiguous && end + 1 == stem {
-        score += 80;
+        80
     } else if start == off && contiguous {
-        score += 30;
-    }
-    Some(score - (name.len() as i32).min(80) / 3)
+        30
+    } else {
+        0
+    };
+    Some(score + placed.min(cap) - (name.len() as i32).min(80) / 3)
 }
 
 /// First byte of `s` that folds to `c` (an already-lowercased query byte).
@@ -470,27 +508,85 @@ fn rfind_folded(s: &[u8], c: u8) -> Option<usize> {
 /// `fuzzy_score` for a one-byte query matched at `i`: the general scoring
 /// loop collapses to one step.
 #[inline]
-fn single_score(name: &[u8], i: usize) -> i32 {
+fn single_score(name: &[u8], i: usize, cap: i32) -> i32 {
     let prev = if i == 0 { Class::Delim } else { class(name[i - 1]) };
     let mut score = SCORE_MATCH + bonus(prev, class(name[i])) * 2;
     let off = (name.len() > 1 && name[0] == b'.') as usize;
     if i == off {
         let stem = name.iter().rposition(|&b| b == b'.').filter(|&p| p > off).unwrap_or(name.len());
-        score += if i + 1 == name.len() {
+        score += cap.min(if i + 1 == name.len() {
             100
         } else if i + 1 == stem {
             80
         } else {
             30
-        };
+        });
     }
     score - (name.len() as i32).min(80) / 3
 }
 
-/// Score a token against a name, honoring its mode.
+/// Best score for `q` read with one typo (see `one_edit_prefix`) at the
+/// start of `name` or of a space-separated word in it: scored as if the
+/// right letters had been typed, minus TYPO_COST, and never placed above a
+/// prefix: "manif" is "manifest" being typed, not a typo of "manic". `m` is
+/// as for `token_score`. Other word starts (`_`, `-`, camelCase) would cost
+/// a scan of every name per query, ~10x the price.
+fn typo_score(name: &[u8], m: u64, q: &[u8]) -> Option<i32> {
+    let mut best = typo_at(name, (name.len() > 1 && name[0] == b'.') as usize, q);
+    if m & char_bit(b' ') != 0 {
+        for sp in memchr::memchr_iter(b' ', name) {
+            best = best.max(typo_at(name, sp + 1, q));
+        }
+    }
+    best
+}
+
+fn typo_at(name: &[u8], s: usize, q: &[u8]) -> Option<i32> {
+    if name.get(s).is_none_or(|&b| fold(b) != q[0]) {
+        return None;
+    }
+    let mut fixed = [0u8; 128];
+    let fixed = fixed.get_mut(..one_edit_prefix(&name[s..], q)?)?;
+    for (f, &b) in fixed.iter_mut().zip(&name[s..]) {
+        *f = fold(b);
+    }
+    Some(fuzzy_score_capped(name, fixed, 30)? - TYPO_COST)
+}
+
+/// How long a prefix of `w` the query `q` spells with exactly one edit (a
+/// wrong, extra, missing or swapped letter), if it does. Digits are never
+/// edited: "hat_18" is another file than "hat_98", not a typo of it.
+fn one_edit_prefix(w: &[u8], q: &[u8]) -> Option<usize> {
+    let starts = |w: &[u8], q: &[u8]| w.len() >= q.len() && w.iter().zip(q).all(|(&a, &b)| fold(a) == b);
+    // The first difference; none means `q` is a clean prefix, not a typo.
+    let i = (0..q.len()).find(|&i| i >= w.len() || fold(w[i]) != q[i])?;
+    if q[i].is_ascii_digit() || w.get(i).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let rest = &q[i + 1..];
+    let after = w.get(i + 1..).unwrap_or_default();
+    if i + 1 < q.len() && i + 1 < w.len() && fold(w[i]) == q[i + 1] && fold(w[i + 1]) == q[i] && starts(&w[i + 2..], &q[i + 2..]) {
+        return Some(q.len());
+    }
+    if i < w.len() && starts(after, rest) {
+        return Some(q.len());
+    }
+    if starts(&w[i..], rest) {
+        return Some(q.len() - 1);
+    }
+    (i < w.len() && starts(after, &q[i..])).then_some(q.len() + 1)
+}
+
+/// Score a token against a name, honoring its mode. `m` is the name's
+/// `index::name_mask`, or any superset of it (`!0` when unknown): it only
+/// skips work.
 #[inline]
-fn token_score(name: &[u8], t: &Token) -> Option<i32> {
+fn token_score(name: &[u8], m: u64, t: &Token) -> Option<i32> {
     match t.mode {
+        Mode::Fuzzy if takes_typos(&t.text, t.mode) => {
+            let clean = if t.mask & !m == 0 { fuzzy_score(name, &t.text) } else { None };
+            clean.max(if m & t.start != 0 { typo_score(name, m, &t.text) } else { None })
+        }
         Mode::Fuzzy => fuzzy_score(name, &t.text),
         Mode::Exact => find_ci(name, &t.text).map(|p| 40 + if p == 0 { 30 } else { 0 } - (name.len() as i32).min(80) / 3),
         Mode::Prefix => {
@@ -505,7 +601,7 @@ fn token_score(name: &[u8], t: &Token) -> Option<i32> {
 fn token_matches(name: &[u8], t: &Token) -> bool {
     match t.mode {
         Mode::Fuzzy => is_subseq(name, &t.text),
-        _ => token_score(name, t).is_some(),
+        _ => token_score(name, !0, t).is_some(),
     }
 }
 
@@ -665,15 +761,15 @@ impl Searcher<'_> {
             let m = mask[k];
             // A name no token can match matters only when there are no positive
             // tokens (then every name passes).
-            let fits = |t: &&Token| m & t.mask == t.mask;
+            let fits = |t: &&Token| t.fits(m);
             if !pos.is_empty() && !pos.iter().any(fits) && !neg.iter().any(fits) {
                 return None;
             }
             let name = idx.uname(k as u32);
             let mut h = NameHit { score: 0, bits: 0, flags: name_flags(name), best: [0; 4] };
             for (t, tok) in pos.iter().enumerate() {
-                if m & tok.mask == tok.mask {
-                    if let Some(s) = token_score(name, tok) {
+                if tok.fits(m) {
+                    if let Some(s) = token_score(name, m, tok) {
                         h.bits |= 1 << t;
                         let s16 = s.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                         h.score = h.score.saturating_add(s16);
@@ -755,10 +851,10 @@ impl Searcher<'_> {
     /// `limit` is all the merge can use.
     fn search_overlay(&self, q: &Query) -> Vec<Hit> {
         let now = now_secs();
-        let masks: Vec<u64> = q.tokens.iter().filter(|t| !t.negate).map(|t| t.mask).collect();
+        let pos: Vec<&Token> = q.tokens.iter().filter(|t| !t.negate).collect();
         // A hit needs some positive token in its own name.
         let cands: Vec<(&Vec<u8>, &crate::live::OEnt)> =
-            self.live.over.iter().filter(|(_, o)| masks.is_empty() || masks.iter().any(|&m| o.mask & m == m)).collect();
+            self.live.over.iter().filter(|(_, o)| pos.is_empty() || pos.iter().any(|t| t.fits(o.mask))).collect();
         // Overlay entries cluster in a few busy folders: match each folder's
         // components once per folder, not per entry.
         let mut hits: Vec<Hit> = cands
@@ -994,7 +1090,8 @@ impl NameKey {
                     } else if a.1 == Mode::Suffix {
                         a.0.ends_with(&b.0)
                     } else {
-                        a.0.starts_with(&b.0)
+                        // Gaining a typo widens the match: score afresh.
+                        a.0.starts_with(&b.0) && takes_typos(&a.0, a.1) == takes_typos(&b.0, b.1)
                     }
             })
     }
