@@ -172,7 +172,7 @@ impl Live {
             if f.path != b"/" {
                 f.attrs = lstat(&f.path);
                 if f.attrs.is_some_and(|a| a.kind & 3 == KIND_DIR && a.kind & FLAG_MOUNT == 0) {
-                    f.scans.insert(f.path.clone(), walk::scan(&f.path, 4).0);
+                    f.scans.insert(f.path.clone(), walk::scan(&f.path, 4));
                 }
             }
             return f;
@@ -195,7 +195,7 @@ impl Live {
             };
             if !was_dir {
                 let child = join(&f.path, name);
-                let ls = walk::scan(&child, 4).0;
+                let ls = walk::scan(&child, 4);
                 f.scans.insert(child, ls);
             }
         }
@@ -310,7 +310,7 @@ impl Live {
             return;
         }
         self.trees.push(path.clone());
-        let ls = scan.unwrap_or_else(|| walk::scan(&path, 4).0);
+        let ls = scan.unwrap_or_else(|| walk::scan(&path, 4));
         for_each_path(&ls, &path, |p, r| {
             let e = OEnt::new(&p, r.kind, r.size, r.mtime);
             self.put(p, e);
@@ -423,7 +423,7 @@ pub fn for_each_path(ls: &[Listing], root: &[u8], mut f: impl FnMut(Vec<u8>, &Ra
     }
 }
 
-fn normalize(path: &[u8]) -> Vec<u8> {
+pub(crate) fn normalize(path: &[u8]) -> Vec<u8> {
     let mut p = path.to_vec();
     while p.len() > 1 && p.last() == Some(&b'/') {
         p.pop();
@@ -446,9 +446,6 @@ fn subtree_bounds(path: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let lo = join(path, b"");
     let mut hi = lo.clone();
     *hi.last_mut().unwrap() += 1; // '/' + 1 == '0'
-    if path == b"/" {
-        return (b"/".to_vec(), b"0".to_vec());
-    }
     (lo, hi)
 }
 

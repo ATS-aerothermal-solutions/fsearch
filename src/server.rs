@@ -1,7 +1,6 @@
 //! The daemon: one `Engine`, answering JSON lines over a unix socket.
 //! `fsearch stdio` and the CLI are thin clients.
 
-use fsearch::query::is_filter;
 use fsearch::walk::{KIND_DIR, KIND_FILE, KIND_LINK};
 use fsearch::{Engine, GrepMode, Options, Query};
 use serde_json::{Value, json};
@@ -85,21 +84,9 @@ fn run(v: &Value, engine: &Engine) -> Result<Value, String> {
             if !s.ready {
                 return Err("indexing (first run scans the whole disk, ~20s)".into());
             }
-            Ok(json!({
-                "ok": true,
-                "entries": s.entries,
-                "dirs": s.dirs,
-                "overlay": s.overlay,
-                "removed": s.removed,
-                "event_id": s.event_id,
-                "index_bytes": s.index_bytes,
-                "content_docs": s.content_docs,
-                "content_segments": s.content_segments,
-                "content_bytes": s.content_bytes,
-                "content_pending": s.content_pending,
-                "full_disk_access": s.full_disk_access,
-                "owner": s.owner,
-            }))
+            let mut v = serde_json::to_value(s).map_err(|e| e.to_string())?;
+            v["ok"] = true.into();
+            Ok(v)
         }
         "search" => {
             let q = parse_request(v, engine.home())?;
@@ -176,7 +163,7 @@ fn parse_request(v: &Value, home: &str) -> Result<Query, String> {
         for (k, val) in obj {
             if k == "limit" {
                 q.limit = val.as_u64().ok_or("limit must be a number")? as usize;
-            } else if is_filter(k) {
+            } else {
                 let s = match val {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
