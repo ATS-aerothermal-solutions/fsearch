@@ -89,3 +89,6 @@ others follow along.
   range. Each distinct name is scored once.
 - Content search uses a trigram index of your text files. Matches are read
   fresh from disk, so they're never stale.
+- PDFs are indexed by their text, extracted with `pdftotext`
+  (`brew install poppler`); without it they are skipped. The text is capped
+  at 4 MB per PDF and each run at 30 s.

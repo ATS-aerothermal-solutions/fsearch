@@ -25,6 +25,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const MAX_FILE: u64 = 1 << 20;
+/// PDFs are indexed by their extracted text (`pdftotext`, from poppler), so
+/// the cap on the file itself is larger than for text files; the text is
+/// capped at the size `match_file` reads, so index and match see the same.
+const PDF_MAX_FILE: u64 = 64 << 20;
+const PDF_TEXT_MAX: u64 = MAX_FILE * 4;
+/// A pdftotext run longer than this is killed.
+const PDF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// File bytes per segment build; bounds the build's transient memory.
 const SEG_BYTES: u64 = 64 << 20;
 /// Largest merge, in posting bytes; bounds the merge's transient memory.
@@ -405,9 +412,13 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
             || Split { seen: vec![0u64; (1 << 24) / 64], buf: Vec::new(), flat: Vec::new(), syms: Vec::new(), docs: Vec::new() },
             |mut sp, i| {
                 sp.buf.clear();
-                let ok = open_regular(docs.path(i))
-                    .and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut sp.buf).ok())
-                    .is_some_and(|n| n as u64 <= MAX_FILE && memchr::memchr(0, &sp.buf[..n.min(8192)]).is_none());
+                let ok = if is_pdf(docs.path(i)) {
+                    pdf_text(docs.path(i), &mut sp.buf).is_some_and(|n| memchr::memchr(0, &sp.buf[..n.min(8192)]).is_none())
+                } else {
+                    open_regular(docs.path(i))
+                        .and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut sp.buf).ok())
+                        .is_some_and(|n| n as u64 <= MAX_FILE && memchr::memchr(0, &sp.buf[..n.min(8192)]).is_none())
+                };
                 let (start, sym) = (sp.flat.len() as u32, sp.syms.len() as u32);
                 if ok {
                     trigrams(&sp.buf, &mut sp.seen, &mut sp.flat);
@@ -625,6 +636,9 @@ pub fn eligible(path: &[u8], size: u64, home: &[u8]) -> bool {
 
 /// The name/size half of eligibility, checkable before building a path.
 fn name_ok(name: &[u8], size: u64) -> bool {
+    if is_pdf(name) {
+        return size <= PDF_MAX_FILE;
+    }
     if size > MAX_FILE {
         return false;
     }
@@ -1010,7 +1024,11 @@ fn match_file(g: &Grep, path: &[u8]) -> Option<FileMatches> {
     READ_BUF.with_borrow_mut(|buf| {
         use std::io::Read;
         buf.clear();
-        open_regular(path)?.take(MAX_FILE * 4).read_to_end(buf).ok()?;
+        if is_pdf(path) {
+            pdf_text(path, buf)?;
+        } else {
+            open_regular(path)?.take(MAX_FILE * 4).read_to_end(buf).ok()?;
+        }
         if memchr::memchr(0, &buf[..buf.len().min(8192)]).is_some() {
             return None;
         }
@@ -1229,6 +1247,51 @@ pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
         .collect();
     files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
     files.into_iter().map(|(p, _)| p).collect()
+}
+
+fn is_pdf(path: &[u8]) -> bool {
+    path.len() > 4 && path[path.len() - 4..].eq_ignore_ascii_case(b".pdf")
+}
+
+/// Where poppler's `pdftotext` is (`brew install poppler`). Without it PDFs
+/// are recorded as non-text, like any unreadable file.
+fn pdftotext_bin() -> Option<&'static Path> {
+    static BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| ["/opt/homebrew/bin/pdftotext", "/usr/local/bin/pdftotext", "/usr/bin/pdftotext"].iter().map(PathBuf::from).find(|p| p.is_file()))
+        .as_deref()
+}
+
+/// The text of a PDF into `buf` (replacing its contents), at most
+/// PDF_TEXT_MAX bytes; its length, or None if there is no text. The file is
+/// opened here (regular files only, same policy as `open_regular`) and handed
+/// to pdftotext as stdin. A run past PDF_TIMEOUT is killed.
+fn pdf_text(path: &[u8], buf: &mut Vec<u8>) -> Option<usize> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    buf.clear();
+    let bin = pdftotext_bin()?;
+    let file = open_regular(path)?;
+    let mut child =
+        Command::new(bin).args(["-q", "-enc", "UTF-8", "-", "-"]).stdin(Stdio::from(file)).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let pid = child.id() as i32;
+    let done = Arc::new(AtomicBool::new(false));
+    let dog = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            std::thread::park_timeout(PDF_TIMEOUT);
+            if !done.load(Ordering::SeqCst) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        })
+    };
+    // Past the cap the pipe is dropped here, so pdftotext gets SIGPIPE.
+    let read = child.stdout.take().map(|o| o.take(PDF_TEXT_MAX).read_to_end(buf));
+    done.store(true, Ordering::SeqCst);
+    dog.thread().unpark();
+    let _ = dog.join();
+    let _ = child.wait();
+    (matches!(read, Some(Ok(_))) && !buf.is_empty()).then_some(buf.len())
 }
 
 /// Open a path for reading only if it is a regular file, never blocking:
