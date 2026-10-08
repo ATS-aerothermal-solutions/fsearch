@@ -14,7 +14,7 @@ pub enum Mode {
     Suffix,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Token {
     pub text: Vec<u8>,
     pub mask: u64,
@@ -48,7 +48,7 @@ fn takes_typos(text: &[u8], mode: Mode) -> bool {
     mode == Mode::Fuzzy && text.len() >= TYPO_MIN_LEN
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Query {
     pub tokens: Vec<Token>,
     pub kind: Option<u8>,
@@ -179,28 +179,10 @@ impl Query {
         }
         Ok(())
     }
-}
 
-impl Query {
     /// The parts of a query that pick files for a content scan.
     pub fn clone_for_scan(&self) -> Query {
-        Query {
-            tokens: self
-                .tokens
-                .iter()
-                .map(|t| Token { text: t.text.clone(), mask: t.mask, mode: t.mode, negate: t.negate, loose: t.loose, start: t.start })
-                .collect(),
-            kind: self.kind,
-            exts: self.exts.clone(),
-            scope: self.scope.clone(),
-            size: self.size,
-            mtime: self.mtime,
-            name_re: self.name_re.clone(),
-            path_re: self.path_re.clone(),
-            limit: self.limit,
-            grep: None,
-            grep_mode: self.grep_mode,
-        }
+        Query { grep: None, ..self.clone() }
     }
 
     /// Does a full path pass every filter and token? Returns the match score.
@@ -612,6 +594,7 @@ fn token_matches(name: &[u8], t: &Token) -> bool {
 struct TopK {
     k: usize,
     buf: Vec<u64>,
+    /// Keys at or below this cannot get in.
     floor: u64,
 }
 
@@ -623,11 +606,6 @@ fn key(score: i32, i: u32) -> u64 {
 impl TopK {
     fn new(k: usize) -> TopK {
         TopK { k, buf: Vec::new(), floor: if k == 0 { u64::MAX } else { 0 } }
-    }
-    /// Keys at or below this cannot get in.
-    #[inline]
-    fn floor(&self) -> u64 {
-        self.floor
     }
     #[inline]
     fn push(&mut self, key: u64) {
@@ -664,7 +642,7 @@ fn top_k(n: usize, k: usize, visit: impl Fn(std::ops::Range<usize>, &mut TopK) +
         })
         .collect();
     // A full piece's k-th best already bounds the overall k-th from below.
-    let floor = tops.iter().filter(|t| t.buf.len() == k).map(|t| t.floor()).max().unwrap_or(0);
+    let floor = tops.iter().filter(|t| t.buf.len() == k).map(|t| t.floor).max().unwrap_or(0);
     let mut keys: Vec<u64> = tops.into_iter().flat_map(|t| t.buf).filter(|&x| x >= floor).collect();
     if keys.len() > k {
         if k == 0 {
@@ -1000,7 +978,7 @@ impl Scan<'_> {
             for i in lo + r.start..lo + r.end {
                 let Some(nh) = self.names.get(ent_name[i]).filter(|h| h.flags & NF_OK != 0) else { continue };
                 let m = memo.map_or(DirMemo::default(), |m| m[parent[i] as usize]);
-                if let Some(k) = self.score(i, nh, m, top.floor(), &mut pbuf) {
+                if let Some(k) = self.score(i, nh, m, top.floor, &mut pbuf) {
                     top.push(k);
                 }
             }
@@ -1022,7 +1000,7 @@ impl Scan<'_> {
                         continue;
                     }
                     let m = if self.need_dirs { self.memo_of(parent[i], &mut memo) } else { DirMemo::default() };
-                    if let Some(k) = self.score(i, nh, m, top.floor(), &mut pbuf) {
+                    if let Some(k) = self.score(i, nh, m, top.floor, &mut pbuf) {
                         top.push(k);
                     }
                 }

@@ -857,10 +857,7 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
     if let Some(d) = idx.lookup(dir).filter(|&e| !live.is_dead(e)).and_then(|e| idx.dir_of(e)) {
         let range = if recursive { idx.dir_start()[d as usize] as usize..idx.dir_end()[d as usize] as usize } else { idx.children(d) };
         for i in range {
-            if idx.kind()[i] & 3 != KIND_FILE || live.is_dead(i as u32) || idx.size_of(i) > MAX_FILE {
-                continue;
-            }
-            if !name_ok(idx.name(i), idx.size_of(i)) {
+            if idx.kind()[i] & 3 != KIND_FILE || live.is_dead(i as u32) || !name_ok(idx.name(i), idx.size_of(i)) {
                 continue;
             }
             if recursive {
@@ -1111,11 +1108,13 @@ struct Info {
 
 const MAX_EXACT: usize = 16;
 
-fn exact_query(set: &[Vec<u8>]) -> TQ {
-    if set.iter().any(|s| s.len() < 3) {
-        return TQ::All;
+/// What a fragment's exact set requires of a doc (All when there is no set,
+/// or a string in it is too short to have a trigram).
+fn exact_query(set: Option<Vec<Vec<u8>>>) -> TQ {
+    match set {
+        Some(set) if set.iter().all(|s| s.len() >= 3) => TQ::Or(set.iter().map(|s| literal_plan(s)).collect()),
+        _ => TQ::All,
     }
-    TQ::Or(set.iter().map(|s| literal_plan(s)).collect())
 }
 
 fn and(a: TQ, b: TQ) -> TQ {
@@ -1139,29 +1138,15 @@ fn info(h: &Hir) -> Info {
         HirKind::Empty | HirKind::Look(_) => Info { exact: Some(vec![Vec::new()]), q: TQ::All },
         HirKind::Literal(l) => Info { exact: Some(vec![l.0.iter().map(|&b| fold(b)).collect()]), q: TQ::All },
         HirKind::Class(c) => {
-            let mut set: Vec<Vec<u8>> = Vec::new();
-            match c {
+            // Up to 8 members: each is an exact string.
+            let mut set: Vec<Vec<u8>> = match c {
                 Class::Unicode(u) => {
-                    if u.ranges().iter().map(|r| r.end() as u32 - r.start() as u32 + 1).sum::<u32>() > 8 {
-                        return all();
-                    }
-                    for r in u.ranges() {
-                        for ch in r.start()..=r.end() {
-                            let mut b = [0u8; 4];
-                            set.push(ch.encode_utf8(&mut b).bytes().map(fold).collect());
-                        }
-                    }
+                    u.ranges().iter().flat_map(|r| r.start()..=r.end()).take(9).map(|ch| ch.to_string().bytes().map(fold).collect()).collect()
                 }
-                Class::Bytes(b) => {
-                    if b.ranges().iter().map(|r| r.end() as u32 - r.start() as u32 + 1).sum::<u32>() > 8 {
-                        return all();
-                    }
-                    for r in b.ranges() {
-                        for x in r.start()..=r.end() {
-                            set.push(vec![fold(x)]);
-                        }
-                    }
-                }
+                Class::Bytes(b) => b.ranges().iter().flat_map(|r| r.start()..=r.end()).take(9).map(|x| vec![fold(x)]).collect(),
+            };
+            if set.len() > 8 {
+                return all();
             }
             set.sort();
             set.dedup();
@@ -1177,7 +1162,7 @@ fn info(h: &Hir) -> Info {
                 return i;
             }
             // At least one copy must appear.
-            Info { exact: None, q: and(i.q, i.exact.map_or(TQ::All, |e| exact_query(&e))) }
+            Info { exact: None, q: and(i.q, exact_query(i.exact)) }
         }
         HirKind::Concat(hs) => {
             let mut cur = Info { exact: Some(vec![Vec::new()]), q: TQ::All };
@@ -1191,10 +1176,10 @@ fn info(h: &Hir) -> Info {
                         Info { exact: Some(set), q: and(cur.q, n.q) }
                     }
                     (a, b) => {
-                        let q = and(and(cur.q, a.map_or(TQ::All, |e| exact_query(&e))), n.q);
+                        let q = and(and(cur.q, exact_query(a)), n.q);
                         match b {
                             Some(b) if b.len() <= MAX_EXACT => Info { exact: Some(b), q },
-                            b => Info { exact: None, q: and(q, b.map_or(TQ::All, |e| exact_query(&e))) },
+                            b => Info { exact: None, q: and(q, exact_query(b)) },
                         }
                     }
                 };
@@ -1211,7 +1196,7 @@ fn info(h: &Hir) -> Info {
                     return Info { exact: Some(set), q: TQ::All };
                 }
             }
-            let ors: Vec<TQ> = parts.into_iter().map(|p| and(p.q, p.exact.map_or(TQ::All, |e| exact_query(&e)))).collect();
+            let ors: Vec<TQ> = parts.into_iter().map(|p| and(p.q, exact_query(p.exact))).collect();
             if ors.iter().any(|q| matches!(q, TQ::All)) { all() } else { Info { exact: None, q: TQ::Or(ors) } }
         }
     }
@@ -1219,7 +1204,7 @@ fn info(h: &Hir) -> Info {
 
 fn regex_plan(h: &Hir) -> TQ {
     let i = info(h);
-    and(i.q, i.exact.map_or(TQ::All, |e| exact_query(&e)))
+    and(i.q, exact_query(i.exact))
 }
 
 /// Files to grep where the content index does not reach (e.g. `in:/etc`),
@@ -1229,21 +1214,19 @@ pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
     q.kind = Some(KIND_FILE);
     q.limit = 200_000;
     q.size = (q.size.0, q.size.1.min(MAX_FILE));
-    let hits = crate::query::Searcher { live }.search(&q);
-    let mut files: Vec<(Vec<u8>, u32)> = Vec::with_capacity(hits.len());
-    let mut p = Vec::new();
-    for h in hits {
-        files.push(match h.over {
+    let mut files: Vec<(Vec<u8>, u32)> = (crate::query::Searcher { live }.search(&q).into_iter())
+        .map(|h| match h.over {
             Some(path) => {
                 let m = live.over[&path].mtime;
                 (path, m)
             }
             None => {
+                let mut p = Vec::new();
                 live.base.path(h.idx as usize, &mut p);
-                (p.clone(), live.base.mtime()[h.idx as usize])
+                (p, live.base.mtime()[h.idx as usize])
             }
-        });
-    }
+        })
+        .collect();
     files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
     files.into_iter().map(|(p, _)| p).collect()
 }
