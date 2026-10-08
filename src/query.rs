@@ -98,8 +98,9 @@ impl Query {
     pub fn parse(s: &str, home: &str) -> Result<Query, String> {
         let mut q = Query { size: (0, u64::MAX), mtime: (0, u32::MAX), limit: 50, ..Default::default() };
         for word in split_words(s) {
-            if let Some((k, v)) = word.split_once(':').filter(|(k, _)| is_filter(k)) {
-                q.filter(k, v, home)?;
+            if let Some((k, v)) = word.split_once(':')
+                && q.filter(k, v, home)?
+            {
                 continue;
             }
             for piece in word.split('/').filter(|p| !p.is_empty()) {
@@ -131,7 +132,8 @@ impl Query {
         self.tokens.push(Token { text, mask, mode, negate, loose, start });
     }
 
-    pub fn filter(&mut self, k: &str, v: &str, home: &str) -> Result<(), String> {
+    /// Apply filter `k:v`; false if `k` is not a filter name.
+    pub fn filter(&mut self, k: &str, v: &str, home: &str) -> Result<bool, String> {
         match k {
             "ext" => self.exts.extend(v.split(',').map(|e| e.trim_start_matches('.').to_ascii_lowercase().into_bytes())),
             "type" => {
@@ -175,9 +177,9 @@ impl Query {
             "grep" | "content" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Literal),
             "regex" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Regex),
             "sym" | "symbol" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Symbol),
-            _ => unreachable!(),
+            _ => return Ok(false),
         }
-        Ok(())
+        Ok(true)
     }
 
     /// The parts of a query that pick files for a content scan.
@@ -264,13 +266,6 @@ impl Query {
 pub struct DirMatch {
     negated: bool,
     best: [Option<i32>; 8],
-}
-
-pub fn is_filter(k: &str) -> bool {
-    matches!(
-        k,
-        "ext" | "type" | "kind" | "in" | "size" | "mtime" | "modified" | "re" | "path" | "limit" | "grep" | "content" | "regex" | "sym" | "symbol"
-    )
 }
 
 /// Split on spaces, keeping "double quoted" runs together.

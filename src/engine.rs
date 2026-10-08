@@ -50,7 +50,9 @@ pub struct Found {
     pub score: i32,
 }
 
+#[derive(serde::Serialize)]
 pub struct Status {
+    #[serde(skip)]
     pub ready: bool,
     pub entries: usize,
     pub dirs: usize,
@@ -363,22 +365,15 @@ fn wait_for_index(dir: &Path) -> Index {
     }
 }
 
+#[rustfmt::skip]
+const GATED_IN_HOME: &[&str] = &[
+    "Desktop", "Documents", "Downloads", "Library/Mobile Documents", "Library/Containers", "Library/Group Containers",
+    "Library/CloudStorage", "Pictures/Photos Library.photoslibrary",
+];
+
 /// Folders macOS guards with a consent prompt (or that hold other volumes).
 pub fn gated(home: &str) -> Vec<Vec<u8>> {
-    [
-        format!("{home}/Desktop"),
-        format!("{home}/Documents"),
-        format!("{home}/Downloads"),
-        format!("{home}/Library/Mobile Documents"),
-        format!("{home}/Library/Containers"),
-        format!("{home}/Library/Group Containers"),
-        format!("{home}/Library/CloudStorage"),
-        format!("{home}/Pictures/Photos Library.photoslibrary"),
-        "/Volumes".to_string(),
-    ]
-    .into_iter()
-    .map(String::into_bytes)
-    .collect()
+    GATED_IN_HOME.iter().map(|d| format!("{home}/{d}").into_bytes()).chain([b"/Volumes".to_vec()]).collect()
 }
 
 /// The system TCC database is readable only with Full Disk Access, and
@@ -408,16 +403,11 @@ fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
     loop {
         let wait = if pending.is_empty() { Duration::from_secs(3600) } else { Duration::from_millis(250) };
         match rx.recv_timeout(wait) {
-            Ok((d, t)) => {
+            Ok(first) => {
                 let now = Instant::now();
-                for key in d.into_iter().map(|p| (p, false)).chain(t.into_iter().map(|p| (p, true))) {
-                    // Most of the disk's churn (Library, caches) is outside the indexed area.
-                    if content::in_scope(&key.0, &home) || (key.1 && home.starts_with(&key.0)) {
-                        pending.entry(key).and_modify(|e| e.1 = now).or_insert((now, now));
-                    }
-                }
-                while let Ok((d, t)) = rx.try_recv() {
+                for (d, t) in std::iter::once(first).chain(rx.try_iter()) {
                     for key in d.into_iter().map(|p| (p, false)).chain(t.into_iter().map(|p| (p, true))) {
+                        // Most of the disk's churn (Library, caches) is outside the indexed area.
                         if content::in_scope(&key.0, &home) || (key.1 && home.starts_with(&key.0)) {
                             pending.entry(key).and_modify(|e| e.1 = now).or_insert((now, now));
                         }
@@ -491,7 +481,7 @@ fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
 fn full_build(shared: &Shared, event_id: u64) -> Index {
     let t = Instant::now();
     let started = crate::query::now_secs();
-    let (ls, _) = walk::scan(b"/", SCAN_THREADS);
+    let ls = walk::scan(b"/", SCAN_THREADS);
     let idx = Index::build(ls, event_id, started, shared.home.as_bytes());
     let path = shared.dir.join("index.bin");
     if let Err(e) = idx.save(&path) {
@@ -540,15 +530,12 @@ fn compact(shared: &Shared) {
 fn relist_changed(shared: &Shared, why: &str, flags: u32) {
     let t = Instant::now();
     let started = crate::query::now_secs();
-    let since = {
-        let g = shared.live.read().unwrap();
-        g.as_ref().unwrap().synced_at
-    };
     // synced_at 0 (unknown) relists everything: a full crawl, done in place.
-    let from = since.saturating_sub(SYNC_MARGIN);
-    let mut dirs = {
+    let (from, mut dirs) = {
         let g = shared.live.read().unwrap();
-        g.as_ref().unwrap().changed_dirs(from)
+        let live = g.as_ref().unwrap();
+        let from = live.synced_at.saturating_sub(SYNC_MARGIN);
+        (from, live.changed_dirs(from))
     };
     dirs.extend(shared.content.read().unwrap().changed_dirs(from));
     dirs.sort();
@@ -584,9 +571,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
             Err(RecvTimeoutError::Timeout) => Vec::new(),
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        while let Ok(b) = rx.try_recv() {
-            events.extend(b);
-        }
+        events.extend(rx.try_iter().flatten());
         // The owner wrote the index files: a follower picks that up now
         // rather than at its next periodic check.
         let owner_wrote = events.iter().any(|e| e.path.starts_with(ours));
@@ -603,11 +588,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                     shared.replaying.store(false, Ordering::Relaxed);
                     continue;
                 }
-                let mut p = e.path;
-                while p.len() > 1 && p.last() == Some(&b'/') {
-                    p.pop();
-                }
-                *dirs.entry(p).or_default() |= e.flags & MUST_SCAN_SUBDIRS != 0;
+                *dirs.entry(crate::live::normalize(&e.path)).or_default() |= e.flags & MUST_SCAN_SUBDIRS != 0;
             }
             let mut rebuild = false;
             let mut trees = Vec::new();

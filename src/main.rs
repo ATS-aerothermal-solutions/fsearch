@@ -212,14 +212,12 @@ fn install(login: bool) {
     launchctl(&["bootout", &target]);
     // bootout returns before the old job is fully gone; bootstrap fails
     // until it is.
-    let ok = (0..50).any(|_| {
-        let done = launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
-        if !done {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        done
-    });
-    if !ok {
+    let bootstrap = || launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
+    let retry = || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        false
+    };
+    if !(0..50).any(|_| bootstrap() || retry()) {
         die("launchctl bootstrap failed");
     }
     println!("installed {} (LaunchAgent {LABEL})", bin.display());

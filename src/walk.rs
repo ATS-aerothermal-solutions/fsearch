@@ -9,7 +9,7 @@ use rayon::Scope;
 use std::cell::RefCell;
 use std::ffi::CString;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 pub const NONE: u32 = u32::MAX;
 
@@ -53,17 +53,9 @@ pub struct Listing {
     pub ents: Vec<RawEnt>,
 }
 
-#[derive(Default)]
-pub struct Stats {
-    pub dirs: AtomicU64,
-    pub entries: AtomicU64,
-    pub denied: AtomicU64,
-}
-
 struct Ctx {
     next_id: AtomicU32,
     out: Vec<Mutex<Vec<Listing>>>,
-    stats: Stats,
 }
 
 thread_local! {
@@ -71,19 +63,15 @@ thread_local! {
 }
 
 /// Scan `root` recursively. Listing id 0 is `root` itself.
-pub fn scan(root: &[u8], threads: usize) -> (Vec<Listing>, Stats) {
+pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).start_handler(|_| crate::no_materialize()).build().unwrap();
-    let ctx = Ctx { next_id: AtomicU32::new(1), out: (0..threads + 1).map(|_| Mutex::new(Vec::new())).collect(), stats: Stats::default() };
+    let ctx = Ctx { next_id: AtomicU32::new(1), out: (0..threads + 1).map(|_| Mutex::new(Vec::new())).collect() };
     raise_fd_limit();
     let fd = if blocked(root) { -1 } else { CString::new(root).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) }) };
     // Paths are only tracked when there is something to skip.
     let path = SKIP.get().is_some_and(|v| !v.is_empty()).then(|| root.to_vec());
     pool.scope(|s| finish_dir(s, fd, path, 0, &ctx));
-    let mut all = Vec::new();
-    for m in ctx.out {
-        all.append(&mut m.into_inner().unwrap());
-    }
-    (all, ctx.stats)
+    ctx.out.into_iter().flat_map(|m| m.into_inner().unwrap()).collect()
 }
 
 fn raise_fd_limit() {
@@ -120,7 +108,6 @@ impl Drop for Fd {
 fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &'s Ctx) {
     let mut l = Listing { id, names: Vec::new(), ents: Vec::new() };
     if fd < 0 {
-        ctx.stats.denied.fetch_add(1, Ordering::Relaxed);
         push(l, ctx);
         return;
     }
@@ -138,8 +125,6 @@ fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &
             kids.push((CString::new(name).unwrap_or_default(), e.child, child_path));
         }
     }
-    ctx.stats.dirs.fetch_add(1, Ordering::Relaxed);
-    ctx.stats.entries.fetch_add(l.ents.len() as u64, Ordering::Relaxed);
     push(l, ctx);
     for (name, cid, child_path) in kids {
         let parent = me.clone();
