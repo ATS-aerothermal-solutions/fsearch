@@ -364,7 +364,7 @@ pub fn now_secs() -> u32 {
 }
 
 #[inline(always)]
-fn fold(b: u8) -> u8 {
+pub(crate) fn fold(b: u8) -> u8 {
     b | (((b.wrapping_sub(b'A') < 26) as u8) << 5)
 }
 

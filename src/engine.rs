@@ -263,7 +263,7 @@ impl Engine {
             let Some(live) = l.as_ref() else { return Err(INDEXING.into()) };
             search_pool().install(|| content::scan_paths(live, q.clone_for_scan()))
         };
-        Ok((content::verify_owned(g, paths, q.limit), false))
+        Ok((content::verify(g, &paths, q.limit), false))
     }
 
     pub fn status(&self) -> Status {
@@ -455,7 +455,7 @@ fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
         for batch in todo.batches() {
             let (dir, id) = {
                 let mut c = shared.content.write().unwrap();
-                (c.dir(), c.alloc_id())
+                (c.dir.clone(), c.alloc_id())
             };
             let len = batch.len();
             if let Some(seg) = pool.install(|| content::build_segment(&dir, id, &todo, batch)) {
@@ -470,11 +470,11 @@ fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
             let Some(ids) = plan else { break };
             let (dir, id) = {
                 let mut c = shared.content.write().unwrap();
-                (c.dir(), c.alloc_id())
+                (c.dir.clone(), c.alloc_id())
             };
             let merged = {
                 let c = shared.content.read().unwrap();
-                pool.install(|| Content::merge(&dir, id, &c.segments(&ids)))
+                pool.install(|| content::merge(&dir, id, &c.segments(&ids)))
             };
             match merged {
                 Some(seg) => shared.content.write().unwrap().replace(&ids, seg),

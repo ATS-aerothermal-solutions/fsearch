@@ -12,8 +12,9 @@
 //! knows about with the docs we hold, reindex what changed, tombstone what
 //! went away. The first build is just a sync of $HOME.
 
+use crate::index::{HDR, as_bytes, fields, header, layout, sec};
 use crate::live::{Live, join};
-use crate::query::{GrepMode, Query};
+use crate::query::{GrepMode, Query, fold};
 use crate::walk::KIND_FILE;
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -32,7 +33,6 @@ const MAGIC: &[u8; 8] = b"FSCSEG03";
 /// tri_off high bit: this trigram's list is a bitset over the segment's docs
 /// (cheaper than varints once more than 1 in 8 docs contain it).
 const BITSET: u32 = 1 << 31;
-const HDR: usize = 4096;
 
 /// Directory names whose subtrees are generated, vendored, or caches.
 #[rustfmt::skip]
@@ -75,7 +75,9 @@ pub struct Segment {
     map: Mmap,
     pub id: u64,
     pub ndocs: usize,
+    ndocs1: usize,
     ntri: usize,
+    ntri1: usize,
     plen: usize,
     paths_len: usize,
     off: [usize; NS],
@@ -101,51 +103,20 @@ fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize) -> [usize; NS]
     [ntri * 4, (ntri + 1) * 4, plen, (ndocs + 1) * 4, paths_len, ndocs * 8, ndocs * 4, ndocs * 4, ndocs]
 }
 
-fn layout(l: &[usize; NS]) -> ([usize; NS], usize) {
-    let mut off = [0; NS];
-    let mut at = HDR;
-    for (k, &n) in l.iter().enumerate() {
-        off[k] = at;
-        at = (at + n + 63) & !63;
-    }
-    (off, at)
-}
-
-macro_rules! sl {
-    ($self:ident, $s:expr, $t:ty, $n:expr) => {
-        unsafe { std::slice::from_raw_parts($self.map.as_ptr().add($self.off[$s as usize]) as *const $t, $n) }
-    };
-}
-
 impl Segment {
-    fn tri_key(&self) -> &[u32] {
-        sl!(self, S::TriKey, u32, self.ntri)
-    }
-    fn tri_off(&self) -> &[u32] {
-        sl!(self, S::TriOff, u32, self.ntri + 1)
-    }
-    fn post(&self) -> &[u8] {
-        sl!(self, S::Post, u8, self.plen)
-    }
-    fn path_off(&self) -> &[u32] {
-        sl!(self, S::PathOff, u32, self.ndocs + 1)
-    }
-    pub fn size(&self) -> &[u64] {
-        sl!(self, S::Size, u64, self.ndocs)
-    }
-    pub fn mtime(&self) -> &[u32] {
-        sl!(self, S::Mtime, u32, self.ndocs)
-    }
-    fn by_path(&self) -> &[u32] {
-        sl!(self, S::ByPath, u32, self.ndocs)
-    }
-    pub fn rank(&self) -> &[i8] {
-        sl!(self, S::Rank, i8, self.ndocs)
-    }
+    sec!(tri_key, S::TriKey, u32, ntri);
+    sec!(tri_off, S::TriOff, u32, ntri1);
+    sec!(post, S::Post, u8, plen);
+    sec!(path_off, S::PathOff, u32, ndocs1);
+    sec!(paths, S::Paths, u8, paths_len);
+    sec!(size, S::Size, u64, ndocs);
+    sec!(mtime, S::Mtime, u32, ndocs);
+    sec!(by_path, S::ByPath, u32, ndocs);
+    sec!(rank, S::Rank, i8, ndocs);
+
     pub fn path(&self, d: u32) -> &[u8] {
         let o = self.path_off();
-        let paths = sl!(self, S::Paths, u8, self.paths_len);
-        &paths[o[d as usize] as usize..o[d as usize + 1] as usize]
+        &self.paths()[o[d as usize] as usize..o[d as usize + 1] as usize]
     }
 
     #[inline]
@@ -232,11 +203,7 @@ impl Segment {
     fn load(dir: &Path, id: u64) -> Option<Segment> {
         let f = std::fs::File::open(seg_path(dir, id)).ok()?;
         let map = unsafe { Mmap::map(&f) }.ok()?;
-        if map.len() < HDR || &map[..8] != MAGIC {
-            return None;
-        }
-        let h = |k: usize| u64::from_le_bytes(map[8 + k * 8..16 + k * 8].try_into().unwrap()) as usize;
-        let (ndocs, ntri, plen, paths_len) = (h(0), h(1), h(2), h(3));
+        let [ndocs, ntri, plen, paths_len] = fields(&map, MAGIC)?.map(|v| v as usize);
         let (off, total) = layout(&lens(ndocs, ntri, plen, paths_len));
         if map.len() < total {
             return None;
@@ -248,7 +215,7 @@ impl Segment {
             }
         }
         let live_docs = ndocs - dead.iter().map(|w| w.count_ones() as usize).sum::<usize>();
-        Some(Segment { map, id, ndocs, ntri, plen, paths_len, off, dead, live_docs })
+        Some(Segment { map, id, ndocs, ndocs1: ndocs + 1, ntri, ntri1: ntri + 1, plen, paths_len, off, dead, live_docs })
     }
 
     fn save_dead(&self, dir: &Path) {
@@ -285,11 +252,6 @@ fn put_varint(out: &mut Vec<u8>, mut v: u32) {
         v >>= 7;
     }
     out.push(v as u8);
-}
-
-#[inline(always)]
-fn fold(b: u8) -> u8 {
-    b | (((b.wrapping_sub(b'A') < 26) as u8) << 5)
 }
 
 /// Append the sorted distinct case-folded trigrams of a buffer to `out`.
@@ -347,25 +309,19 @@ fn symbols(buf: &[u8], out: &mut Vec<u32>) {
             .build()
             .unwrap()
     });
-    let start = out.len();
+    let mut keys = Vec::new();
     let mut at = 0;
     while let Some(m) = re.find_at(buf, at) {
         let end = m.end();
         let begin = buf[..end].iter().rposition(|&b| !(b.is_ascii_alphanumeric() || b == b'_')).map_or(0, |p| p + 1);
-        out.push(symbol_key(&buf[begin..end]));
+        keys.push(symbol_key(&buf[begin..end]));
         // The name may itself be a keyword ("static func main"): look again
         // from it, not past it.
         at = begin;
     }
-    out[start..].sort_unstable();
-    let mut seen = start;
-    for i in start..out.len() {
-        if i == start || out[i] != out[seen - 1] {
-            out[seen] = out[i];
-            seen += 1;
-        }
-    }
-    out.truncate(seen);
+    keys.sort_unstable();
+    keys.dedup();
+    out.extend(keys);
 }
 
 /// Paths with size and mtime, all in one buffer: a full sync holds ~500k
@@ -553,7 +509,7 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
 
 /// Merge segments into one, dropping tombstoned docs. Postings stay in
 /// order because docs are renumbered segment by segment.
-fn merge_segments(dir: &Path, id: u64, segs: &[&Segment]) -> Option<Segment> {
+pub fn merge(dir: &Path, id: u64, segs: &[&Segment]) -> Option<Segment> {
     let mut meta = Vec::new();
     let mut remap: Vec<Vec<u32>> = Vec::with_capacity(segs.len());
     for s in segs {
@@ -630,16 +586,18 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
     by_path.sort_by(|&a, &b| docs[a as usize].path.cmp(&docs[b as usize].path));
 
     let (off, _) = layout(&lens(ndocs, keys.len(), post.len(), paths.len()));
-    let mut hdr = vec![0u8; HDR];
-    hdr[..8].copy_from_slice(MAGIC);
-    for (k, v) in [ndocs, keys.len(), post.len(), paths.len()].iter().enumerate() {
-        hdr[8 + k * 8..16 + k * 8].copy_from_slice(&(*v as u64).to_le_bytes());
-    }
-    fn bytes<T: Copy>(v: &[T]) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
-    }
-    let sections: [&[u8]; NS] =
-        [bytes(&keys), bytes(&tri_off), &post, bytes(&path_off), &paths, bytes(&size), bytes(&mtime), bytes(&by_path), bytes(&rank)];
+    let hdr = header(MAGIC, &[ndocs as u64, keys.len() as u64, post.len() as u64, paths.len() as u64]);
+    let sections: [&[u8]; NS] = [
+        as_bytes(&keys),
+        as_bytes(&tri_off),
+        &post,
+        as_bytes(&path_off),
+        &paths,
+        as_bytes(&size),
+        as_bytes(&mtime),
+        as_bytes(&by_path),
+        as_bytes(&rank),
+    ];
     let p = seg_path(dir, id);
     let tmp = p.with_extension("tmp");
     let write = || -> std::io::Result<()> {
@@ -706,7 +664,7 @@ fn doc_rank(path: &[u8]) -> i8 {
 }
 
 pub struct Content {
-    dir: PathBuf,
+    pub dir: PathBuf,
     pub segs: Vec<Segment>,
     next_id: u64,
 }
@@ -856,14 +814,6 @@ impl Content {
         self.save_manifest();
     }
 
-    pub fn merge(dir: &Path, id: u64, segs: &[&Segment]) -> Option<Segment> {
-        merge_segments(dir, id, segs)
-    }
-
-    pub fn dir(&self) -> PathBuf {
-        self.dir.clone()
-    }
-
     /// Candidate docs for a pattern, filtered by the name query.
     fn candidates(&self, plan: &TQ, filt: &Query) -> Vec<(usize, u32)> {
         let mut out: Vec<(usize, u32)> = self
@@ -891,9 +841,7 @@ impl Content {
         let plan = g.plan();
         let cands = self.candidates(&plan, filt);
         let paths: Vec<&[u8]> = cands.iter().map(|&(si, d)| self.segs[si].path(d)).collect();
-        let mut r = verify(g, &paths, filt.limit);
-        r.candidates = cands.len();
-        r
+        verify(g, &paths, filt.limit)
     }
 }
 
@@ -1034,9 +982,9 @@ pub struct FileMatches {
 /// Read candidates in rank order, in parallel batches, until `limit` files
 /// have matched or the time budget is spent (best-ranked results first, so a
 /// cut-short search still returns the ones you most likely wanted).
-pub fn verify(g: &Grep, paths: &[&[u8]], limit: usize) -> GrepResult {
+pub fn verify(g: &Grep, paths: &[impl AsRef<[u8]> + Sync], limit: usize) -> GrepResult {
     let t = std::time::Instant::now();
-    let mut r = GrepResult::default();
+    let mut r = GrepResult { candidates: paths.len(), ..Default::default() };
     let mut at = 0;
     let mut batch = 64;
     while at < paths.len() && r.files.len() < limit {
@@ -1044,7 +992,7 @@ pub fn verify(g: &Grep, paths: &[&[u8]], limit: usize) -> GrepResult {
             break;
         }
         let end = (at + batch).min(paths.len());
-        let found: Vec<Option<FileMatches>> = read_pool().install(|| paths[at..end].par_iter().map(|p| match_file(g, p)).collect());
+        let found: Vec<Option<FileMatches>> = read_pool().install(|| paths[at..end].par_iter().map(|p| match_file(g, p.as_ref())).collect());
         r.read += end - at;
         r.files.extend(found.into_iter().flatten());
         at = end;
@@ -1065,35 +1013,30 @@ fn match_file(g: &Grep, path: &[u8]) -> Option<FileMatches> {
     READ_BUF.with_borrow_mut(|buf| {
         use std::io::Read;
         buf.clear();
-        let mut f = open_regular(path)?;
-        Read::take(&mut f, MAX_FILE * 4).read_to_end(buf).ok()?;
-        match_buf(g, path, buf)
+        open_regular(path)?.take(MAX_FILE * 4).read_to_end(buf).ok()?;
+        if memchr::memchr(0, &buf[..buf.len().min(8192)]).is_some() {
+            return None;
+        }
+        let mut lines = Vec::new();
+        let (mut line_no, mut counted) = (1usize, 0usize);
+        let mut last_line_start = usize::MAX;
+        for m in g.re.find_iter(&buf) {
+            line_no += memchr::memchr_iter(b'\n', &buf[counted..m.start()]).count();
+            counted = m.start();
+            let ls = memchr::memrchr(b'\n', &buf[..m.start()]).map_or(0, |p| p + 1);
+            if ls == last_line_start {
+                continue;
+            }
+            last_line_start = ls;
+            let le = memchr::memchr(b'\n', &buf[m.start()..]).map_or(buf.len(), |p| m.start() + p);
+            let text = String::from_utf8_lossy(&buf[ls..le.min(ls + 400)]).trim_end().to_string();
+            lines.push((line_no, text));
+            if lines.len() >= g.max_per_file {
+                break;
+            }
+        }
+        (!lines.is_empty()).then(|| FileMatches { path: path.to_vec(), lines })
     })
-}
-
-fn match_buf(g: &Grep, path: &[u8], buf: &[u8]) -> Option<FileMatches> {
-    if memchr::memchr(0, &buf[..buf.len().min(8192)]).is_some() {
-        return None;
-    }
-    let mut lines = Vec::new();
-    let (mut line_no, mut counted) = (1usize, 0usize);
-    let mut last_line_start = usize::MAX;
-    for m in g.re.find_iter(&buf) {
-        line_no += memchr::memchr_iter(b'\n', &buf[counted..m.start()]).count();
-        counted = m.start();
-        let ls = memchr::memrchr(b'\n', &buf[..m.start()]).map_or(0, |p| p + 1);
-        if ls == last_line_start {
-            continue;
-        }
-        last_line_start = ls;
-        let le = memchr::memchr(b'\n', &buf[m.start()..]).map_or(buf.len(), |p| m.start() + p);
-        let text = String::from_utf8_lossy(&buf[ls..le.min(ls + 400)]).trim_end().to_string();
-        lines.push((line_no, text));
-        if lines.len() >= g.max_per_file {
-            break;
-        }
-    }
-    (!lines.is_empty()).then(|| FileMatches { path: path.to_vec(), lines })
 }
 
 /// A trigram query: which docs could possibly match.
@@ -1303,13 +1246,6 @@ pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
     }
     files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
     files.into_iter().map(|(p, _)| p).collect()
-}
-
-pub fn verify_owned(g: &Grep, paths: Vec<Vec<u8>>, limit: usize) -> GrepResult {
-    let refs: Vec<&[u8]> = paths.iter().map(Vec::as_slice).collect();
-    let mut r = verify(g, &refs, limit);
-    r.candidates = refs.len();
-    r
 }
 
 /// Open a path for reading only if it is a regular file, never blocking:

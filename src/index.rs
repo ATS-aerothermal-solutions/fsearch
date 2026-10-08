@@ -18,7 +18,6 @@ use std::io::Write;
 use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"FSIDX007";
-const HDR: usize = 4096;
 
 #[derive(Clone, Copy)]
 enum Sec {
@@ -68,6 +67,8 @@ pub struct MemoPlan {
     pub chunks: Vec<(u32, std::ops::Range<u32>)>,
 }
 
+/// A typed view of one section of `self.map`, `self.$len` long. Shared with
+/// content segments, which use the same file layout (see `layout`).
 macro_rules! sec {
     ($name:ident, $s:expr, $t:ty, $len:ident) => {
         pub fn $name(&self) -> &[$t] {
@@ -75,6 +76,7 @@ macro_rules! sec {
         }
     };
 }
+pub(crate) use sec;
 
 impl Index {
     // Per distinct name: char mask, offset into `names` (u + 1 entries).
@@ -326,50 +328,54 @@ impl Index {
         }
 
         // Write the blob.
-        let (off, total) = offsets(&section_lens(n, d, u, unames.len()));
+        let (off, total) = layout(&section_lens(n, d, u, unames.len()));
         let mut m = MmapMut::map_anon(total).expect("anon map");
-        let base = m.as_mut_ptr();
-        fn put<T: Copy>(base: *mut u8, at: usize, v: &[T]) {
-            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, base.add(at), std::mem::size_of_val(v)) };
-        }
-        put(base, off[Sec::NameMask as usize], &umask);
-        put(base, off[Sec::NameOff as usize], &uoff);
-        put(base, off[Sec::Names as usize], &unames);
-        put(base, off[Sec::EntName as usize], &ent_name);
-        put(base, off[Sec::Kind as usize], &kind[..n]);
-        put(base, off[Sec::Parent as usize], &parent[..n]);
-        put(base, off[Sec::Size as usize], &enc);
-        put(base, off[Sec::Mtime as usize], &mtime[..n]);
-        put(base, off[Sec::DirEntry as usize], &dir_entry);
-        put(base, off[Sec::DirStart as usize], &blocks.iter().map(|b| b.1).collect::<Vec<_>>());
-        put(base, off[Sec::DirLen as usize], &blocks.iter().map(|b| b.2).collect::<Vec<_>>());
-        put(base, off[Sec::DirEnd as usize], &end);
-        put(base, off[Sec::DirPrior as usize], &prior);
-        put(base, off[Sec::DirParent as usize], &dir_entry.iter().map(|&e| parent[e as usize]).collect::<Vec<_>>());
-        put(base, off[Sec::NameEntsOff as usize], &ne_off);
-        put(base, off[Sec::NameEnts as usize], &ne);
-        put(base, 0, &header(n, d, u, unames.len(), event_id, synced_at));
+        let mut put = |s: Sec, v: &[u8]| m[off[s as usize]..][..v.len()].copy_from_slice(v);
+        put(Sec::NameMask, as_bytes(&umask));
+        put(Sec::NameOff, as_bytes(&uoff));
+        put(Sec::Names, &unames);
+        put(Sec::EntName, as_bytes(&ent_name));
+        put(Sec::Kind, &kind[..n]);
+        put(Sec::Parent, as_bytes(&parent[..n]));
+        put(Sec::Size, as_bytes(&enc));
+        put(Sec::Mtime, as_bytes(&mtime[..n]));
+        put(Sec::DirEntry, as_bytes(&dir_entry));
+        put(Sec::DirStart, as_bytes(&blocks.iter().map(|b| b.1).collect::<Vec<_>>()));
+        put(Sec::DirLen, as_bytes(&blocks.iter().map(|b| b.2).collect::<Vec<_>>()));
+        put(Sec::DirEnd, as_bytes(&end));
+        put(Sec::DirPrior, as_bytes(&prior));
+        put(Sec::DirParent, as_bytes(&dir_entry.iter().map(|&e| parent[e as usize]).collect::<Vec<_>>()));
+        put(Sec::NameEntsOff, as_bytes(&ne_off));
+        put(Sec::NameEnts, as_bytes(&ne));
+        m[..HDR].copy_from_slice(&header(MAGIC, &[n as u64, d as u64, u as u64, unames.len() as u64, event_id, synced_at as u64]));
         Index::from_map(m.make_read_only().unwrap()).unwrap()
     }
 
     fn from_map(map: Mmap) -> Option<Index> {
-        if map.len() < HDR || &map[..8] != MAGIC {
-            return None;
-        }
-        let h = |k: usize| u64::from_le_bytes(map[8 + k * 8..16 + k * 8].try_into().unwrap()) as usize;
-        let (n, d, u, names_len) = (h(0), h(1), h(2), h(3));
-        let (off, total) = offsets(&section_lens(n, d, u, names_len));
+        let [n, d, u, names_len, event_id, synced_at] = fields(&map, MAGIC)?.map(|v| v as usize);
+        let (off, total) = layout(&section_lens(n, d, u, names_len));
         if map.len() < total {
             return None;
         }
-        Some(Index { n, d, u, u1: u + 1, names_len, event_id: h(4) as u64, synced_at: h(5) as u32, off, map, plan: std::sync::OnceLock::new() })
+        Some(Index {
+            n,
+            d,
+            u,
+            u1: u + 1,
+            names_len,
+            event_id: event_id as u64,
+            synced_at: synced_at as u32,
+            off,
+            map,
+            plan: std::sync::OnceLock::new(),
+        })
     }
 
     /// Write atomically (tmp + rename), stamping the current event id.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let tmp = path.with_extension("tmp");
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&header(self.n, self.d, self.u, self.names_len, self.event_id, self.synced_at))?;
+        f.write_all(&header(MAGIC, &[self.n as u64, self.d as u64, self.u as u64, self.names_len as u64, self.event_id, self.synced_at as u64]))?;
         f.write_all(&self.map[HDR..])?;
         f.sync_data()?;
         std::fs::rename(tmp, path)
@@ -378,9 +384,9 @@ impl Index {
     /// The event id a saved index is current as of, from its header alone.
     pub fn saved_event_id(path: &Path) -> Option<u64> {
         use std::io::Read;
-        let mut h = [0u8; 48];
+        let mut h = [0u8; 56];
         std::fs::File::open(path).ok()?.read_exact(&mut h).ok()?;
-        (&h[..8] == MAGIC).then(|| u64::from_le_bytes(h[40..48].try_into().unwrap()))
+        fields::<6>(&h, MAGIC).map(|f| f[4])
     }
 
     pub fn load(path: &Path) -> Option<Index> {
@@ -407,13 +413,37 @@ impl Index {
     }
 }
 
-fn header(n: usize, d: usize, u: usize, names_len: usize, event_id: u64, synced_at: u32) -> Vec<u8> {
+/// Section files (this index, content segments): a 4 KiB header (magic,
+/// then u64 fields), then the sections, each 64-byte aligned.
+pub(crate) const HDR: usize = 4096;
+
+pub(crate) fn header(magic: &[u8; 8], fields: &[u64]) -> Vec<u8> {
     let mut h = vec![0u8; HDR];
-    h[..8].copy_from_slice(MAGIC);
-    for (k, v) in [n as u64, d as u64, u as u64, names_len as u64, event_id, synced_at as u64].iter().enumerate() {
+    h[..8].copy_from_slice(magic);
+    for (k, v) in fields.iter().enumerate() {
         h[8 + k * 8..16 + k * 8].copy_from_slice(&v.to_le_bytes());
     }
     h
+}
+
+/// The header's fields, if `b` starts with `magic`.
+pub(crate) fn fields<const N: usize>(b: &[u8], magic: &[u8; 8]) -> Option<[u64; N]> {
+    (b.len() >= 8 + N * 8 && &b[..8] == magic).then(|| std::array::from_fn(|k| u64::from_le_bytes(b[8 + k * 8..16 + k * 8].try_into().unwrap())))
+}
+
+/// Section offsets for these lengths, and the file size.
+pub(crate) fn layout<const N: usize>(lens: &[usize; N]) -> ([usize; N], usize) {
+    let mut off = [0usize; N];
+    let mut at = HDR;
+    for (k, &l) in lens.iter().enumerate() {
+        off[k] = at;
+        at = (at + l + 63) & !63;
+    }
+    (off, at)
+}
+
+pub(crate) fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
 fn section_lens(n: usize, d: usize, u: usize, names_len: usize) -> [usize; NSEC] {
@@ -450,16 +480,6 @@ impl std::hash::Hasher for FxH {
     fn finish(&self) -> u64 {
         self.0
     }
-}
-
-fn offsets(lens: &[usize; NSEC]) -> ([usize; NSEC], usize) {
-    let mut off = [0usize; NSEC];
-    let mut at = HDR;
-    for (k, &l) in lens.iter().enumerate() {
-        off[k] = at;
-        at = (at + l + 63) & !63;
-    }
-    (off, at)
 }
 
 /// Which character classes a name contains. A query token can only match a
